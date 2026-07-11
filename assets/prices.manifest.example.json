@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "catalog_revision": "2026-07-10.3",
+  "catalog_reference": "prices.json",
+  "catalog_sha256": "5255319d6fc863b02178dc217d3077cf7b6ba45d874cd134056b0aa5cc2e1f83",
+  "published_at": "2026-07-10T00:00:00Z",
+  "verified_at": "2026-07-10T00:00:00Z",
+  "evidence": {
+    "source_ids": [
+      "anthropic-pricing",
+      "anthropic-model-ids",
+      "anthropic-models",
+      "anthropic-release-notes",
+      "openai-api-pricing",
+      "openai-prompt-caching",
+      "openai-codex-pricing",
+      "openai-codex-speed",
+      "openai-changelog"
+    ],
+    "note": "Example checksum manifest binding this catalog revision to the reviewed official source records embedded in prices.json. The manifest itself must be pinned by an independently trusted SHA-256 value; this is not a cryptographic signature."
+  }
+}

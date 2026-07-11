@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a focused improvement that preserves accounting and privacy guarantees.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user problem independently of a preferred implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: accounting
+    attributes:
+      label: Accounting implications
+      description: Explain how unknown values, pricing status, cash evidence, and compatibility should behave.
+
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy implications
+      description: Identify any new source data, persistence, output, or network behavior.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: data
+    attributes:
+      label: Data confirmation
+      options:
+        - label: This request contains no real transcript, account, credential, receipt, database, config, or user-path data.
+          required: true

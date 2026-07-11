@@ -1,0 +1,444 @@
+{
+  "schema_version": 1,
+  "revision": "2026-07-10.3",
+  "published_at": "2026-07-10T00:00:00Z",
+  "verified_at": "2026-07-10T00:00:00Z",
+  "stale_after_days": 30,
+  "coverage_note": "Current-price snapshot verified 2026-07-10. API-equivalent model rates begin at each model's official release date when the official launch/current documentation supports that price; Codex-credit rates without a dated publication boundary remain effective only from verification. Missing historical periods, OpenAI contexts at or above 272K where the checked table only labels a below-272K rate, unlisted third-party models, and unlisted token classes remain unpriced.",
+  "sources": [
+    {
+      "id": "anthropic-pricing",
+      "title": "Anthropic model and feature pricing",
+      "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official USD model, 5m/1h prompt-cache, cache-read, fast-mode, geography, web-search, and web-fetch rates."
+    },
+    {
+      "id": "anthropic-model-ids",
+      "title": "Anthropic model IDs and versioning",
+      "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official pinned IDs and pre-4.6 dated alias behavior."
+    },
+    {
+      "id": "anthropic-models",
+      "title": "Anthropic models overview",
+      "url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official current Claude API IDs and aliases."
+    },
+    {
+      "id": "anthropic-release-notes",
+      "title": "Claude Platform release notes",
+      "url": "https://platform.claude.com/docs/en/release-notes/overview",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official release dates for Claude Haiku 4.5, Sonnet 4.6, Opus 4.8, and Fable 5."
+    },
+    {
+      "id": "openai-api-pricing",
+      "title": "OpenAI API pricing",
+      "url": "https://developers.openai.com/api/docs/pricing",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official standard and priority per-million-token USD rates."
+    },
+    {
+      "id": "openai-prompt-caching",
+      "title": "OpenAI prompt caching",
+      "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official GPT-5.6 prompt-caching semantics: cache writes cost 1.25x uncached input and are reported as cache_write_tokens."
+    },
+    {
+      "id": "openai-codex-pricing",
+      "title": "Codex pricing and token credit rate card",
+      "url": "https://learn.chatgpt.com/docs/pricing#what-are-tokens-and-credits",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official Codex credits per million input, cached-input, and output tokens."
+    },
+    {
+      "id": "openai-codex-speed",
+      "title": "Codex fast mode",
+      "url": "https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official 2.5x GPT-5.5 and 2x GPT-5.4 Codex credit multipliers."
+    },
+    {
+      "id": "openai-changelog",
+      "title": "OpenAI API changelog",
+      "url": "https://developers.openai.com/api/docs/changelog",
+      "retrieved_at": "2026-07-10T00:00:00Z",
+      "note": "Official gpt-5.6 alias and gpt-5-codex pricing relationship/release record."
+    }
+  ],
+  "aliases": [
+    {
+      "id": "alias-claude-fable-5",
+      "provider": "anthropic",
+      "raw_model": "claude-fable-5",
+      "canonical_model": "claude-fable-5",
+      "effective_from": "2026-06-09T00:00:00Z",
+      "source_ids": ["anthropic-models", "anthropic-release-notes"]
+    },
+    {
+      "id": "alias-claude-opus-4-8",
+      "provider": "anthropic",
+      "raw_model": "claude-opus-4-8",
+      "canonical_model": "claude-opus-4-8",
+      "effective_from": "2026-05-28T00:00:00Z",
+      "source_ids": ["anthropic-model-ids", "anthropic-models", "anthropic-release-notes"]
+    },
+    {
+      "id": "alias-claude-sonnet-4-6",
+      "provider": "anthropic",
+      "raw_model": "claude-sonnet-4-6",
+      "canonical_model": "claude-sonnet-4-6",
+      "effective_from": "2026-02-17T00:00:00Z",
+      "source_ids": ["anthropic-model-ids", "anthropic-release-notes"]
+    },
+    {
+      "id": "alias-claude-haiku-4-5-snapshot",
+      "provider": "anthropic",
+      "raw_model": "claude-haiku-4-5-20251001",
+      "canonical_model": "claude-haiku-4-5-20251001",
+      "effective_from": "2025-10-15T00:00:00Z",
+      "source_ids": ["anthropic-model-ids", "anthropic-models", "anthropic-release-notes"]
+    },
+    {
+      "id": "alias-claude-haiku-4-5",
+      "provider": "anthropic",
+      "raw_model": "claude-haiku-4-5",
+      "canonical_model": "claude-haiku-4-5-20251001",
+      "effective_from": "2025-10-15T00:00:00Z",
+      "source_ids": ["anthropic-model-ids", "anthropic-models", "anthropic-release-notes"]
+    },
+    {
+      "id": "alias-openai-gpt-5-6-sol",
+      "provider": "openai",
+      "raw_model": "gpt-5.6-sol",
+      "canonical_model": "gpt-5.6-sol",
+      "effective_from": "2026-07-09T00:00:00Z",
+      "source_ids": ["openai-api-pricing", "openai-changelog"]
+    },
+    {
+      "id": "alias-openai-gpt-5-6",
+      "provider": "openai",
+      "raw_model": "gpt-5.6",
+      "canonical_model": "gpt-5.6-sol",
+      "effective_from": "2026-07-09T00:00:00Z",
+      "source_ids": ["openai-changelog"]
+    },
+    {
+      "id": "alias-openai-gpt-5-5",
+      "provider": "openai",
+      "raw_model": "gpt-5.5",
+      "canonical_model": "gpt-5.5",
+      "effective_from": "2026-04-24T00:00:00Z",
+      "source_ids": ["openai-api-pricing", "openai-codex-pricing"]
+    },
+    {
+      "id": "alias-openai-gpt-5-4",
+      "provider": "openai",
+      "raw_model": "gpt-5.4",
+      "canonical_model": "gpt-5.4",
+      "effective_from": "2026-03-05T00:00:00Z",
+      "source_ids": ["openai-api-pricing", "openai-codex-pricing"]
+    },
+    {
+      "id": "alias-openai-gpt-5-codex",
+      "provider": "openai",
+      "raw_model": "gpt-5-codex",
+      "canonical_model": "gpt-5-codex",
+      "effective_from": "2025-09-23T00:00:00Z",
+      "source_ids": ["openai-changelog"]
+    }
+  ],
+  "rates": [
+    {
+      "id": "anthropic-claude-fable-5-usd",
+      "provider": "anthropic",
+      "canonical_model": "claude-fable-5",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2026-06-09T00:00:00Z",
+      "dimension_policies": {
+        "speed": {"allowed": ["standard"], "default": "standard", "aliases": {"normal": "standard"}},
+        "inference_geo": {"allowed": ["global", "us"], "default": "global"}
+      },
+      "rates": {"input": "10", "cache_read": "1", "cache_write_5m": "12.5", "cache_write_1h": "20", "output": "50"},
+      "tool_rates": {
+        "web_search_requests": {"rate": "10", "per_units": 1000},
+        "web_fetch_requests": {"rate": "0", "per_units": 1, "explicit_free": true}
+      },
+      "cache_write_observation_required": true,
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "anthropic-claude-opus-4-8-usd",
+      "provider": "anthropic",
+      "canonical_model": "claude-opus-4-8",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2026-05-28T00:00:00Z",
+      "dimension_policies": {
+        "speed": {"allowed": ["standard", "fast"], "default": "standard", "aliases": {"normal": "standard"}},
+        "inference_geo": {"allowed": ["global", "us"], "default": "global"}
+      },
+      "rates": {"input": "5", "cache_read": "0.5", "cache_write_5m": "6.25", "cache_write_1h": "10", "output": "25"},
+      "tool_rates": {
+        "web_search_requests": {"rate": "10", "per_units": 1000},
+        "web_fetch_requests": {"rate": "0", "per_units": 1, "explicit_free": true}
+      },
+      "cache_write_observation_required": true,
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "anthropic-claude-sonnet-4-6-usd",
+      "provider": "anthropic",
+      "canonical_model": "claude-sonnet-4-6",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2026-02-17T00:00:00Z",
+      "dimension_policies": {
+        "speed": {"allowed": ["standard"], "default": "standard", "aliases": {"normal": "standard"}},
+        "inference_geo": {"allowed": ["global", "us"], "default": "global"}
+      },
+      "rates": {"input": "3", "cache_read": "0.3", "cache_write_5m": "3.75", "cache_write_1h": "6", "output": "15"},
+      "tool_rates": {
+        "web_search_requests": {"rate": "10", "per_units": 1000},
+        "web_fetch_requests": {"rate": "0", "per_units": 1, "explicit_free": true}
+      },
+      "cache_write_observation_required": true,
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "anthropic-claude-haiku-4-5-usd",
+      "provider": "anthropic",
+      "canonical_model": "claude-haiku-4-5-20251001",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2025-10-15T00:00:00Z",
+      "dimension_policies": {
+        "speed": {"allowed": ["standard"], "default": "standard", "aliases": {"normal": "standard"}},
+        "inference_geo": {"allowed": ["global"], "default": "global"}
+      },
+      "rates": {"input": "1", "cache_read": "0.1", "cache_write_5m": "1.25", "cache_write_1h": "2", "output": "5"},
+      "tool_rates": {
+        "web_search_requests": {"rate": "10", "per_units": 1000},
+        "web_fetch_requests": {"rate": "0", "per_units": 1, "explicit_free": true}
+      },
+      "cache_write_observation_required": true,
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "openai-gpt-5-6-sol-usd-standard",
+      "provider": "openai",
+      "canonical_model": "gpt-5.6-sol",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2026-07-09T00:00:00Z",
+      "dimension_policies": {
+        "service_tier": {"allowed": ["standard", "priority"], "default": "standard", "aliases": {"default": "standard", "fast": "standard"}}
+      },
+      "rates": {"input": "5", "cache_read": "0.5", "cache_write": "6.25", "output": "30"},
+      "cache_write_observation_required": true,
+      "source_ids": ["openai-api-pricing", "openai-prompt-caching"]
+    },
+    {
+      "id": "openai-gpt-5-5-usd-standard-under-272k",
+      "provider": "openai",
+      "canonical_model": "gpt-5.5",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2026-04-24T00:00:00Z",
+      "max_input_tokens_exclusive": 272000,
+      "dimension_policies": {
+        "service_tier": {"allowed": ["standard", "priority"], "default": "standard", "aliases": {"default": "standard", "fast": "standard"}}
+      },
+      "rates": {"input": "5", "cache_read": "0.5", "output": "30"},
+      "source_ids": ["openai-api-pricing", "openai-prompt-caching"]
+    },
+    {
+      "id": "openai-gpt-5-4-usd-standard-under-272k",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2026-03-05T00:00:00Z",
+      "max_input_tokens_exclusive": 272000,
+      "dimension_policies": {
+        "service_tier": {"allowed": ["standard", "priority"], "default": "standard", "aliases": {"default": "standard", "fast": "standard"}}
+      },
+      "rates": {"input": "2.5", "cache_read": "0.25", "output": "15"},
+      "source_ids": ["openai-api-pricing", "openai-prompt-caching"]
+    },
+    {
+      "id": "openai-gpt-5-codex-usd-standard",
+      "provider": "openai",
+      "canonical_model": "gpt-5-codex",
+      "kind": "usd_api_equivalent",
+      "unit_scale": 1000000,
+      "effective_from": "2025-09-23T00:00:00Z",
+      "dimension_policies": {
+        "service_tier": {"allowed": ["standard", "priority"], "default": "standard", "aliases": {"default": "standard", "fast": "standard"}}
+      },
+      "rates": {"input": "1.25", "cache_read": "0.125", "output": "10"},
+      "source_ids": ["openai-api-pricing", "openai-changelog"],
+      "note": "The official Codex changelog states gpt-5-codex uses the same API price as gpt-5. No current Codex-credit rate is published for this older model."
+    },
+    {
+      "id": "openai-gpt-5-6-sol-credits-standard",
+      "provider": "openai",
+      "canonical_model": "gpt-5.6-sol",
+      "kind": "codex_credits",
+      "unit_scale": 1000000,
+      "effective_from": "2026-07-09T00:00:00Z",
+      "dimension_policies": {
+        "auth_mode": {"allowed": ["chatgpt"], "aliases": {"chatgpt_auth": "chatgpt", "oauth": "chatgpt"}},
+        "speed": {"allowed": ["standard"], "aliases": {"default": "standard", "normal": "standard"}}
+      },
+      "rates": {"input": "125", "cache_read": "12.5", "output": "750"},
+      "source_ids": ["openai-codex-pricing"],
+      "note": "The official credit card prices non-cached input, cached input, and output. Cache-write tokens remain part of non-cached input for credit accounting; there is no separate cache-write credit class."
+    },
+    {
+      "id": "openai-gpt-5-5-credits-standard",
+      "provider": "openai",
+      "canonical_model": "gpt-5.5",
+      "kind": "codex_credits",
+      "unit_scale": 1000000,
+      "effective_from": "2026-07-10T00:00:00Z",
+      "dimension_policies": {
+        "auth_mode": {"allowed": ["chatgpt"], "aliases": {"chatgpt_auth": "chatgpt", "oauth": "chatgpt"}},
+        "speed": {"allowed": ["standard", "fast"], "aliases": {"default": "standard", "normal": "standard"}}
+      },
+      "rates": {"input": "125", "cache_read": "12.5", "output": "750"},
+      "source_ids": ["openai-codex-pricing", "openai-codex-speed"]
+    },
+    {
+      "id": "openai-gpt-5-4-credits-standard",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4",
+      "kind": "codex_credits",
+      "unit_scale": 1000000,
+      "effective_from": "2026-07-10T00:00:00Z",
+      "dimension_policies": {
+        "auth_mode": {"allowed": ["chatgpt"], "aliases": {"chatgpt_auth": "chatgpt", "oauth": "chatgpt"}},
+        "speed": {"allowed": ["standard", "fast"], "aliases": {"default": "standard", "normal": "standard"}}
+      },
+      "rates": {"input": "62.5", "cache_read": "6.25", "output": "375"},
+      "source_ids": ["openai-codex-pricing", "openai-codex-speed"]
+    }
+  ],
+  "modifiers": [
+    {
+      "id": "anthropic-claude-fable-5-us-geo",
+      "provider": "anthropic",
+      "canonical_model": "claude-fable-5",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-06-09T00:00:00Z",
+      "selectors": {"inference_geo": "us"},
+      "multiplier": "1.1",
+      "scope": "token_rates",
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "anthropic-claude-opus-4-8-us-geo",
+      "provider": "anthropic",
+      "canonical_model": "claude-opus-4-8",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-05-28T00:00:00Z",
+      "selectors": {"inference_geo": "us"},
+      "multiplier": "1.1",
+      "scope": "token_rates",
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "anthropic-claude-opus-4-8-fast",
+      "provider": "anthropic",
+      "canonical_model": "claude-opus-4-8",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-05-28T00:00:00Z",
+      "selectors": {"speed": "fast"},
+      "multiplier": "2",
+      "scope": "token_rates",
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "anthropic-claude-sonnet-4-6-us-geo",
+      "provider": "anthropic",
+      "canonical_model": "claude-sonnet-4-6",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-02-17T00:00:00Z",
+      "selectors": {"inference_geo": "us"},
+      "multiplier": "1.1",
+      "scope": "token_rates",
+      "source_ids": ["anthropic-pricing", "anthropic-release-notes"]
+    },
+    {
+      "id": "openai-gpt-5-6-sol-usd-priority",
+      "provider": "openai",
+      "canonical_model": "gpt-5.6-sol",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-07-09T00:00:00Z",
+      "selectors": {"service_tier": "priority"},
+      "multiplier": "2",
+      "scope": "token_rates",
+      "source_ids": ["openai-api-pricing", "openai-changelog"]
+    },
+    {
+      "id": "openai-gpt-5-5-usd-priority",
+      "provider": "openai",
+      "canonical_model": "gpt-5.5",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-04-24T00:00:00Z",
+      "selectors": {"service_tier": "priority"},
+      "multiplier": "2.5",
+      "scope": "token_rates",
+      "source_ids": ["openai-api-pricing", "openai-changelog"]
+    },
+    {
+      "id": "openai-gpt-5-4-usd-priority",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2026-03-05T00:00:00Z",
+      "selectors": {"service_tier": "priority"},
+      "multiplier": "2",
+      "scope": "token_rates",
+      "source_ids": ["openai-api-pricing", "openai-changelog"]
+    },
+    {
+      "id": "openai-gpt-5-codex-usd-priority",
+      "provider": "openai",
+      "canonical_model": "gpt-5-codex",
+      "kind": "usd_api_equivalent",
+      "effective_from": "2025-09-23T00:00:00Z",
+      "selectors": {"service_tier": "priority"},
+      "multiplier": "2",
+      "scope": "token_rates",
+      "source_ids": ["openai-api-pricing", "openai-changelog"]
+    },
+    {
+      "id": "openai-gpt-5-5-credits-fast",
+      "provider": "openai",
+      "canonical_model": "gpt-5.5",
+      "kind": "codex_credits",
+      "effective_from": "2026-07-10T00:00:00Z",
+      "selectors": {"speed": "fast"},
+      "multiplier": "2.5",
+      "scope": "token_rates",
+      "source_ids": ["openai-codex-speed"]
+    },
+    {
+      "id": "openai-gpt-5-4-credits-fast",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4",
+      "kind": "codex_credits",
+      "effective_from": "2026-07-10T00:00:00Z",
+      "selectors": {"speed": "fast"},
+      "multiplier": "2",
+      "scope": "token_rates",
+      "source_ids": ["openai-codex-speed"]
+    }
+  ]
+}

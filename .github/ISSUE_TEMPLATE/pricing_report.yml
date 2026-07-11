@@ -1,0 +1,67 @@
+name: Pricing correction
+description: Report a catalog rule or estimate that differs from primary provider documentation.
+title: "[Pricing]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Pricing reports must use public primary documentation. Do not attach private invoices, receipts, account screenshots, or session data.
+
+  - type: input
+    id: catalog_revision
+    attributes:
+      label: Catalog revision
+      placeholder: "2026-07-10.3"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model identifier
+    validations:
+      required: true
+
+  - type: input
+    id: effective_date
+    attributes:
+      label: Usage or effective date
+      placeholder: "YYYY-MM-DD"
+    validations:
+      required: true
+
+  - type: input
+    id: source
+    attributes:
+      label: Primary documentation URL
+      placeholder: "https://..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_result
+    attributes:
+      label: Current sanitized result
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_math
+    attributes:
+      label: Expected rule and exact arithmetic
+    validations:
+      required: true
+
+  - type: textarea
+    id: dimensions
+    attributes:
+      label: Relevant dimensions
+      description: For example geography, authentication route, token class, or context boundary. Do not guess missing values.
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: This report contains no private account, billing, receipt, or session information.
+          required: true

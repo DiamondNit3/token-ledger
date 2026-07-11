@@ -1,0 +1,24 @@
+{
+  "object": "page",
+  "data": [
+    {
+      "object": "bucket",
+      "start_time": 1783656000,
+      "end_time": 1783659600,
+      "results": [
+        {
+          "object": "organization.usage.completions.result",
+          "model": "gpt-5.6-sol",
+          "input_tokens": 120,
+          "input_cached_tokens": 20,
+          "output_tokens": 7,
+          "num_model_requests": 2,
+          "project_id": "project-private-canary",
+          "user_id": "user-private-canary",
+          "api_key_id": "key-private-canary"
+        }
+      ]
+    }
+  ],
+  "has_more": false
+}
