@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Token Ledger third-party notices</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 74rem; margin: 2rem auto; padding: 0 1rem 4rem; line-height: 1.5; }
+    a { color: inherit; }
+    section { border-top: 1px solid #8888; padding-top: 1rem; margin-top: 2rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #8881; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Token Ledger third-party notices</h1>
+    <p>This file identifies the third-party packages included in Token Ledger release binaries and reproduces their selected license texts.</p>
+    <h2>License overview</h2>
+    <ul>
+      {{#each overview}}
+      <li>{{name}} ({{count}})</li>
+      {{/each}}
+    </ul>
+    {{#each licenses}}
+    <section>
+      <h2>{{name}} <small>({{id}})</small></h2>
+      <p>Used by:</p>
+      <ul>
+        {{#each used_by}}
+        <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+        {{/each}}
+      </ul>
+      <pre>{{text}}</pre>
+    </section>
+    {{/each}}
+  </main>
+</body>
+</html>

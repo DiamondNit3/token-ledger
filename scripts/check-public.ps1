@@ -9,7 +9,7 @@ Push-Location $root
 
 try {
     Write-Host '==> Inspecting Cargo source-package boundary' -ForegroundColor Cyan
-    $entries = @(& cargo package --allow-dirty --no-verify --list)
+    $entries = @(& cargo package --allow-dirty --locked --list)
     if ($LASTEXITCODE -ne 0) {
         throw "cargo package --list failed with exit code $LASTEXITCODE"
     }
@@ -26,7 +26,7 @@ try {
         throw "Forbidden files entered the source package: $($forbiddenEntries -join ', ')"
     }
 
-    $textExtensions = @('.rs', '.md', '.toml', '.json', '.jsonl', '.sh', '.ps1', '.lock', '.gitignore')
+    $textExtensions = @('.rs', '.md', '.toml', '.json', '.jsonl', '.html', '.hbs', '.txt', '.sh', '.ps1', '.lock', '.gitignore')
     $patterns = [ordered]@{
         'Windows user path' = ('[A-Za-z]:\\' + 'Users\\' + '[^\\\s]+')
         'macOS user path' = ('/' + 'Users/' + '[^/\s]+')
@@ -59,6 +59,32 @@ try {
         throw "Potential private content found (matching text is intentionally not printed): $($findings -join ', ')"
     }
 
+    Write-Host '==> Verifying third-party notice lock binding' -ForegroundColor Cyan
+    $noticePath = Join-Path $root 'THIRD-PARTY-NOTICES.html'
+    if (-not (Test-Path -LiteralPath $noticePath -PathType Leaf)) {
+        throw 'THIRD-PARTY-NOTICES.html is missing.'
+    }
+    $lockHash = (Get-FileHash -LiteralPath (Join-Path $root 'Cargo.lock') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $notice = [IO.File]::ReadAllText($noticePath)
+    if (-not $notice.Contains("Cargo.lock sha256:$lockHash")) {
+        throw 'THIRD-PARTY-NOTICES.html does not match Cargo.lock; regenerate it before release.'
+    }
+
+    $fixedNoticeHashes = [ordered]@{
+        'RUST-1.88-STANDARD-LIBRARY-NOTICES.html' = '3d3f60160f5214efa0a7fd804102d02ce9ea6af04b5249a19eeb243450246ae9'
+        'MUSL-1.2.3-COPYRIGHT.txt' = 'f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af'
+    }
+    foreach ($asset in $fixedNoticeHashes.GetEnumerator()) {
+        $assetPath = Join-Path $root $asset.Key
+        if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
+            throw "Required toolchain notice is missing: $($asset.Key)"
+        }
+        $actualHash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $asset.Value) {
+            throw "Toolchain notice hash changed and requires review: $($asset.Key)"
+        }
+    }
+
     Write-Host '==> Inspecting dependency license metadata' -ForegroundColor Cyan
     $metadata = (& cargo metadata --format-version 1 --locked) | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) {
@@ -75,7 +101,7 @@ try {
         throw "Dependencies without declared license metadata: $($missingLicenses.name -join ', ')"
     }
 
-    Write-Host "Public-content check passed: $($entries.Count) packaged entries; no forbidden paths or common secret patterns." -ForegroundColor Green
+    Write-Host "Public-content check passed: $($entries.Count) packaged entries; no forbidden paths or common secret patterns; third-party notices declare the current Cargo.lock digest." -ForegroundColor Green
 }
 finally {
     Pop-Location

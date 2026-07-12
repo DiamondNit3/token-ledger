@@ -11,7 +11,7 @@ body:
     id: version
     attributes:
       label: Token Ledger version
-      placeholder: "ledger 0.3.0"
+      placeholder: "token-ledger 0.4.0"
     validations:
       required: true
 

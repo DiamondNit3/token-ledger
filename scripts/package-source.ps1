@@ -33,7 +33,7 @@ try {
     }
 
     Write-Host "==> Building source package $($package.version)" -ForegroundColor Cyan
-    & cargo package --allow-dirty --no-verify --locked
+    & cargo package --allow-dirty --locked
     if ($LASTEXITCODE -ne 0) {
         throw "cargo package failed with exit code $LASTEXITCODE"
     }
@@ -65,7 +65,7 @@ try {
     }
     New-Item -ItemType Directory -Path $stage | Out-Null
 
-    $entries = @(& cargo package --allow-dirty --no-verify --list)
+    $entries = @(& cargo package --allow-dirty --locked --list)
     if ($LASTEXITCODE -ne 0) {
         throw "cargo package --list failed with exit code $LASTEXITCODE"
     }

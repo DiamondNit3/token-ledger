@@ -1,0 +1,116 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "Zlib",
+]
+
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+ignore-dev-dependencies = true
+workarounds = ["chrono", "rustls"]
+private = { ignore = true }
+
+# ring 0.17.14 split its license files and retains distinct BoringSSL-derived
+# ISC headers in source files. The built-in cargo-about workaround targets an
+# older monolithic layout, so this version is clarified explicitly.
+[ring.clarify]
+license = "Apache-2.0 AND ISC"
+
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+
+[[ring.clarify.files]]
+path = "src/polyfill/once_cell/LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/aes_nohw.c"
+license = "ISC"
+checksum = "e01f82dc64c40e422eb046cba40fce87545c6a45bc9719e23176ef53bdb8ce8b"
+start = "/* Copyright (c) 2019, Google Inc."
+end = " * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */"
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.h"
+license = "ISC"
+checksum = "19c779f8bbc141fa15c14e0a15aacaee2da917f7043af883c90cbef3cd6f4847"
+start = "/* Copyright (c) 2015, Google Inc."
+end = " * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */"
+
+[[ring.clarify.files]]
+path = "crypto/poly1305/poly1305.c"
+license = "ISC"
+checksum = "9d3cd1e69f280a14314994684fb0f503013e1159d5168f8cbb63931bd49ed814"
+start = "/* Copyright (c) 2014, Google Inc."
+end = " * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */"
+
+[[ring.clarify.files]]
+path = "src/aead/chacha.rs"
+license = "ISC"
+checksum = "11aa22050eba0e953f55d501a1b49a55c6b06159c901732d781154f6574363a4"
+start = "// Copyright 2016 Brian Smith."
+end = "// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/chacha/fallback.rs"
+license = "ISC"
+checksum = "4421ff0815e4335b07d51c8e52f424e32275318f6dcece2d4555fdfab513971c"
+start = "// Copyright 2021 Brian Smith."
+end = "// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */"
+
+[[ring.clarify.files]]
+path = "src/aead/gcm/fallback.rs"
+license = "ISC"
+checksum = "408bc1b7dbc5e6542dcb5af61db43a843e02240a38c9563905942b90d8890052"
+start = "// Copyright (c) 2019, Google Inc."
+end = "// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/poly1305/ffi_fallback.rs"
+license = "ISC"
+checksum = "21c84e03d2c76600f116c4213aa6889960bb882ef19c172644ec29470f62cb5a"
+start = "// Copyright 2015-2025 Brian Smith."
+end = "// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+# zstd-sys statically compiles the bundled Zstandard C library and ships
+# generated bindings under BSD-3-Clause in addition to its MIT Rust wrapper.
+[zstd-sys.clarify]
+license = "MIT AND BSD-3-Clause"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE.Mit"
+license = "MIT"
+checksum = "129e8edef29e9abcd2ebabe252f4ef1b1289cdca356bf0040284a2fbccfb96c8"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE.BSD-3-Clause"
+license = "BSD-3-Clause"
+checksum = "48341f685c87304089aa099b23c386f8bacc519ef555aa7a13e239908907b3fd"
+
+[[zstd-sys.clarify.files]]
+path = "zstd/LICENSE"
+license = "BSD-3-Clause"
+checksum = "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"

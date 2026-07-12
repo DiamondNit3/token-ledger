@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
   workflow_dispatch:
 
@@ -30,12 +32,12 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy, rustfmt
 
@@ -54,18 +56,31 @@ jobs:
         shell: pwsh
         run: ./scripts/check-public.ps1
 
+      - name: Install pinned notice generator
+        if: matrix.os == 'windows-latest'
+        run: cargo install --locked --features cli cargo-about --version 0.9.1
+
+      - name: Fetch the locked all-target notice graph
+        if: matrix.os == 'windows-latest'
+        run: cargo fetch --locked
+
+      - name: Reproduce third-party notices
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/generate-third-party-notices.ps1 -Check
+
   msrv:
     name: Minimum Rust 1.88
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4 # 1.88.0
 
       - name: Run tests on the minimum supported Rust version
         run: cargo test --all-targets --locked

@@ -1,9 +1,16 @@
 * text=auto
 
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+LICENSE text eol=lf
 *.rs text eol=lf
 *.toml text eol=lf
 *.lock text eol=lf
 *.md text eol=lf
+*.html text eol=lf
+*.hbs text eol=lf
+*.txt text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.json text eol=lf
@@ -13,4 +20,10 @@
 
 *.crate binary
 *.exe binary
+*.gif binary
 *.zip binary
+
+# Preserve byte-exact upstream/generated license text while keeping diff
+# whitespace checks useful for hand-maintained files.
+RUST-1.88-STANDARD-LIBRARY-NOTICES.html whitespace=-trailing-space
+THIRD-PARTY-NOTICES.html whitespace=-trailing-space

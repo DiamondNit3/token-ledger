@@ -21,7 +21,7 @@ echo '==> Tests'
 cargo test --all-targets --locked
 
 echo '==> Cargo source-package boundary'
-entries=$(cargo package --allow-dirty --no-verify --list)
+entries=$(cargo package --allow-dirty --locked --list)
 if printf '%s\n' "$entries" | grep -E '^(dist|target|open-source)/|(^|/)test-evidence\.html$|\.(exe|zip|sqlite3|log)$|(^|/)(ledger\.toml|\.env)$' >/dev/null; then
     echo 'Forbidden generated or private file entered the source package.' >&2
     exit 1

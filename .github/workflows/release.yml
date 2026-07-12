@@ -1,0 +1,371 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  notices:
+    name: Reproduce third-party notices
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.88.0
+
+      - name: Install pinned notice generator
+        run: cargo install --locked --features cli cargo-about --version 0.9.1
+
+      - name: Fetch the locked all-target notice graph
+        run: cargo fetch --locked
+
+      - name: Inspect public package and fixed notice assets
+        shell: pwsh
+        run: ./scripts/check-public.ps1
+
+      - name: Require reproducible notices
+        shell: pwsh
+        run: ./scripts/generate-third-party-notices.ps1 -Check
+
+  build:
+    name: Build / ${{ matrix.label }}
+    needs: notices
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - label: Linux x64 static
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - label: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - label: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Windows release
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'token-ledger').version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo version $version"
+          }
+          $bundle = "token-ledger-v$version-${{ matrix.target }}"
+          $stage = Join-Path 'release-stage' $bundle
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $lockHash = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
+          $notice = [IO.File]::ReadAllText((Join-Path (Get-Location) 'THIRD-PARTY-NOTICES.html'))
+          if (-not $notice.Contains("Cargo.lock sha256:$lockHash")) {
+            throw 'THIRD-PARTY-NOTICES.html does not match Cargo.lock'
+          }
+          Copy-Item "target/${{ matrix.target }}/release/token-ledger.exe" "$stage/token-ledger.exe"
+          Copy-Item README.md, LICENSE, THIRD-PARTY-NOTICES.html, RUST-1.88-STANDARD-LIBRARY-NOTICES.html, MUSL-1.2.3-COPYRIGHT.txt, assets/prices.manifest.example.json $stage
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $archive = "dist/$bundle.zip"
+          Compress-Archive -Path $stage -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$archive.sha256", "$hash  $([IO.Path]::GetFileName($archive))`n", [Text.UTF8Encoding]::new($false))
+
+          $verifyRoot = Join-Path 'release-verify' $bundle
+          New-Item -ItemType Directory -Path $verifyRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $verifyRoot
+          $rootEntries = @(Get-ChildItem -LiteralPath $verifyRoot -Force)
+          if ($rootEntries.Count -ne 1 -or -not $rootEntries[0].PSIsContainer -or $rootEntries[0].Name -ne $bundle) {
+            throw "Archive must contain exactly one top-level directory named $bundle"
+          }
+          $extractedRoot = $rootEntries[0].FullName
+          $directories = @(Get-ChildItem -LiteralPath $extractedRoot -Force | Where-Object PSIsContainer)
+          if ($directories.Count -ne 0) {
+            throw "Archive contains unexpected nested directories: $($directories.Name -join ', ')"
+          }
+          $expectedFiles = @('LICENSE', 'MUSL-1.2.3-COPYRIGHT.txt', 'README.md', 'RUST-1.88-STANDARD-LIBRARY-NOTICES.html', 'THIRD-PARTY-NOTICES.html', 'prices.manifest.example.json', 'token-ledger.exe') | Sort-Object
+          $actualFiles = @(Get-ChildItem -LiteralPath $extractedRoot -File -Force | Select-Object -ExpandProperty Name | Sort-Object)
+          $fileDifference = @(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles)
+          if ($fileDifference.Count -ne 0) {
+            throw "Extracted file list did not match the release contract: $($fileDifference | Out-String)"
+          }
+
+          $fixedNoticeHashes = [ordered]@{
+            'RUST-1.88-STANDARD-LIBRARY-NOTICES.html' = '3d3f60160f5214efa0a7fd804102d02ce9ea6af04b5249a19eeb243450246ae9'
+            'MUSL-1.2.3-COPYRIGHT.txt' = 'f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af'
+          }
+          foreach ($asset in $fixedNoticeHashes.GetEnumerator()) {
+            $actualHash = (Get-FileHash (Join-Path $extractedRoot $asset.Key) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $asset.Value) {
+              throw "Extracted notice hash did not match the release contract: $($asset.Key)"
+            }
+          }
+
+          $extractedBinary = Join-Path $extractedRoot 'token-ledger.exe'
+          $versionOutput = (& $extractedBinary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -ne "token-ledger $version") {
+            throw "Extracted binary reported unexpected version '$versionOutput'"
+          }
+          & $extractedBinary prices verify --plain
+          if ($LASTEXITCODE -ne 0) { throw 'Extracted binary failed catalog verification' }
+          & $extractedBinary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Extracted binary failed the help smoke test' }
+          $demoOutput = (& $extractedBinary --plain demo | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $demoOutput -notmatch 'TOKEN LEDGER / DEMO') {
+            throw 'Extracted binary failed the isolated demo smoke test'
+          }
+
+      - name: Package Unix release
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 - <<'PY'
+          import json, subprocess
+          metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"]))
+          print(next(package["version"] for package in metadata["packages"] if package["name"] == "token-ledger"))
+          PY
+          )
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${version}" >&2
+            exit 1
+          fi
+          bundle="token-ledger-v${version}-${{ matrix.target }}"
+          stage="release-stage/${bundle}"
+          mkdir -p "$stage" dist
+          lock_hash=$(shasum -a 256 Cargo.lock | awk '{print $1}')
+          grep -F "Cargo.lock sha256:${lock_hash}" THIRD-PARTY-NOTICES.html >/dev/null
+          cp "target/${{ matrix.target }}/release/token-ledger" "$stage/token-ledger"
+          cp README.md LICENSE THIRD-PARTY-NOTICES.html RUST-1.88-STANDARD-LIBRARY-NOTICES.html MUSL-1.2.3-COPYRIGHT.txt assets/prices.manifest.example.json "$stage/"
+          chmod 755 "$stage/token-ledger"
+          tar -C release-stage -czf "dist/${bundle}.tar.gz" "$bundle"
+          shasum -a 256 "dist/${bundle}.tar.gz" | sed 's#  dist/#  #' > "dist/${bundle}.tar.gz.sha256"
+          (
+            cd dist
+            shasum -a 256 --check "${bundle}.tar.gz.sha256"
+          )
+
+          verify_root="release-verify/${bundle}"
+          mkdir -p "$verify_root"
+          tar -xzf "dist/${bundle}.tar.gz" -C "$verify_root"
+          shopt -s nullglob dotglob
+          top_entries=("$verify_root"/*)
+          shopt -u nullglob dotglob
+          if [[ ${#top_entries[@]} -ne 1 || ! -d "${top_entries[0]}" || "$(basename "${top_entries[0]}")" != "$bundle" ]]; then
+            echo "Archive must contain exactly one top-level directory named $bundle" >&2
+            exit 1
+          fi
+          extracted_root="${top_entries[0]}"
+          expected_files=(LICENSE MUSL-1.2.3-COPYRIGHT.txt README.md RUST-1.88-STANDARD-LIBRARY-NOTICES.html THIRD-PARTY-NOTICES.html prices.manifest.example.json token-ledger)
+          actual_files=()
+          shopt -s nullglob dotglob
+          for path in "$extracted_root"/*; do
+            if [[ ! -f "$path" ]]; then
+              echo "Archive contains unexpected non-file entry: $path" >&2
+              exit 1
+            fi
+            actual_files+=("$(basename "$path")")
+          done
+          shopt -u nullglob dotglob
+          if ! diff -u \
+            <(printf '%s\n' "${expected_files[@]}" | LC_ALL=C sort) \
+            <(printf '%s\n' "${actual_files[@]}" | LC_ALL=C sort); then
+            echo 'Extracted file list did not match the release contract' >&2
+            exit 1
+          fi
+          (
+            cd "$extracted_root"
+            printf '%s  %s\n' \
+              '3d3f60160f5214efa0a7fd804102d02ce9ea6af04b5249a19eeb243450246ae9' 'RUST-1.88-STANDARD-LIBRARY-NOTICES.html' \
+              'f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af' 'MUSL-1.2.3-COPYRIGHT.txt' \
+              | shasum -a 256 --check
+          )
+
+          extracted_binary="$extracted_root/token-ledger"
+          [[ -x "$extracted_binary" ]]
+          version_output=$("$extracted_binary" --version)
+          if [[ "$version_output" != "token-ledger $version" ]]; then
+            echo "Extracted binary reported unexpected version '$version_output'" >&2
+            exit 1
+          fi
+          "$extracted_binary" prices verify --plain
+          "$extracted_binary" --help >/dev/null
+          "$extracted_binary" --plain demo | grep -F 'TOKEN LEDGER / DEMO' >/dev/null
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish checksummed release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require an annotated release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${GITHUB_REF_NAME}"
+          object_type=$(git cat-file -t "$tag_ref")
+          if [[ "$object_type" != 'tag' ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} is lightweight; create an annotated or signed tag." >&2
+            exit 1
+          fi
+
+      - name: Require finalized release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          heading_prefix="## ${version} - "
+          mapfile -t matching_headings < <(grep -F "$heading_prefix" CHANGELOG.md || true)
+          if [[ ${#matching_headings[@]} -ne 1 ]]; then
+            echo "::error::CHANGELOG.md must contain exactly one '${heading_prefix}YYYY-MM-DD' heading." >&2
+            exit 1
+          fi
+          release_date="${matching_headings[0]#"$heading_prefix"}"
+          if [[ ! "$release_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::CHANGELOG.md release date '$release_date' is not YYYY-MM-DD." >&2
+            exit 1
+          fi
+
+      - name: Reject an existing GitHub release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          endpoint="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
+          status=$(curl --silent --show-error --location \
+            --output "$RUNNER_TEMP/existing-release.json" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$endpoint")
+          case "$status" in
+            404) ;;
+            200)
+              echo "::error::A GitHub release already exists for ${GITHUB_REF_NAME}; published releases are immutable." >&2
+              exit 1
+              ;;
+            *)
+              echo "::error::Could not safely determine release existence; GitHub returned HTTP ${status}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Download all release candidates
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Consolidate and verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t checksum_files < <(find dist -maxdepth 1 -type f -name '*.sha256' | LC_ALL=C sort)
+          if [[ ${#checksum_files[@]} -ne 4 ]]; then
+            echo "Expected 4 per-platform checksum files, found ${#checksum_files[@]}" >&2
+            exit 1
+          fi
+          mapfile -t archive_files < <(find dist -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | LC_ALL=C sort)
+          if [[ ${#archive_files[@]} -ne 4 ]]; then
+            echo "Expected 4 platform archives, found ${#archive_files[@]}" >&2
+            exit 1
+          fi
+          cat "${checksum_files[@]}" | LC_ALL=C sort -k2 > dist/SHA256SUMS.txt
+          if [[ $(wc -l < dist/SHA256SUMS.txt) -ne 4 ]]; then
+            echo 'SHA256SUMS.txt must contain exactly 4 archive entries' >&2
+            exit 1
+          fi
+          if ! diff -u \
+            <(printf '%s\n' "${archive_files[@]##*/}" | LC_ALL=C sort) \
+            <(awk '{print $2}' dist/SHA256SUMS.txt | LC_ALL=C sort); then
+            echo 'The checksummed filenames do not exactly match the release archives' >&2
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum --check SHA256SUMS.txt
+          )
+
+      - name: Publish release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
+        with:
+          generate_release_notes: true
+          body: |
+            ## Binary trust and checksum verification
+
+            - The macOS binaries are **unsigned and not notarized**. macOS may require explicit approval before first launch.
+            - The Windows binary is **unsigned** and may trigger Microsoft Defender SmartScreen.
+            - Verify the downloaded archive against `SHA256SUMS.txt` before extraction. On Linux run `sha256sum --check SHA256SUMS.txt`; on macOS run `shasum -a 256 --check SHA256SUMS.txt`; on Windows compute `Get-FileHash <archive> -Algorithm SHA256` and compare it with the matching entry.
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
