@@ -7,6 +7,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use rust_decimal::Decimal;
 
+use crate::config::create_private_dir_all;
 use crate::model::{
     CanonicalEvent, Client, ClientCoverageSnapshot, CoverageEventBoundary, CoverageStatus,
     CoverageWindowStatus, EventProvenance, LedgerCoverageSnapshot, ObservationProvenance,
@@ -45,6 +46,7 @@ pub struct SourceCheckpoint {
     pub checkpoint_hash: String,
     pub head_hash: String,
     pub adapter_state: serde_json::Value,
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -74,13 +76,17 @@ pub struct LedgerStats {
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).with_context(|| {
+            create_private_dir_all(parent).with_context(|| {
                 format!("failed to create database directory {}", parent.display())
             })?;
         }
+        prepare_private_database_file(path)?;
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open ledger database {}", path.display()))?;
-        Self::from_connection(connection, path.to_path_buf(), "WAL")
+        harden_sqlite_files(path)?;
+        let ledger = Self::from_connection(connection, path.to_path_buf(), "WAL")?;
+        harden_sqlite_files(path)?;
+        Ok(ledger)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -121,8 +127,10 @@ impl Ledger {
                 checkpoint_hash TEXT NOT NULL DEFAULT '',
                 head_hash TEXT NOT NULL DEFAULT '',
                 adapter_state TEXT NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL DEFAULT '',
                 last_scan_at TEXT,
-                last_status TEXT NOT NULL DEFAULT 'new'
+                last_status TEXT NOT NULL DEFAULT 'new',
+                privacy_write_generation INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS usage_observations (
@@ -151,6 +159,7 @@ impl Ledger {
                 source_locator TEXT NOT NULL,
                 parser_version TEXT NOT NULL,
                 warnings_json TEXT NOT NULL,
+                privacy_write_generation INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(source_file_id, event_key)
             );
 
@@ -198,7 +207,8 @@ impl Ledger {
                 code TEXT NOT NULL,
                 message TEXT NOT NULL,
                 locator TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                privacy_write_generation INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS reconciliation_imports (
@@ -209,7 +219,8 @@ impl Ledger {
                 provider TEXT,
                 imported_at TEXT NOT NULL,
                 byte_count INTEGER NOT NULL,
-                bucket_count INTEGER NOT NULL
+                bucket_count INTEGER NOT NULL,
+                privacy_write_generation INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS reconciliation_buckets (
@@ -251,7 +262,10 @@ impl Ledger {
             .optional()?;
         match existing {
             None => {
-                let transaction = self.connection.transaction()?;
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+                ensure_v6_storage_columns(&transaction)?;
                 transaction.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
                     [SCHEMA_VERSION.to_string()],
@@ -261,9 +275,19 @@ impl Ledger {
                     params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_COMPLETE],
                 )?;
                 ensure_v6_identity_indexes(&transaction)?;
+                install_privacy_write_guard_triggers(&transaction)?;
                 transaction.commit()?;
             }
             Some(version) if version == SCHEMA_VERSION => {
+                // Upgrading an already-created v6 database is intentionally
+                // idempotent: early v0.4 builds did not yet have the write
+                // generation barrier.
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+                ensure_v6_storage_columns(&transaction)?;
+                install_privacy_write_guard_triggers(&transaction)?;
+                transaction.commit()?;
                 let privacy_state = self
                     .connection
                     .query_row(
@@ -316,7 +340,9 @@ impl Ledger {
     }
 
     fn migrate_v1_to_v2(&mut self) -> Result<()> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
         let source_paths = {
             let mut statement = transaction.prepare("SELECT id, path FROM source_files")?;
             statement
@@ -406,7 +432,9 @@ impl Ledger {
         // a post-commit VACUUM removes legacy raw identifiers from database
         // pages and the surrounding checkpoints truncate copies from the WAL.
         self.connection.pragma_update(None, "secure_delete", "ON")?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
         scrub_legacy_private_values(&transaction)?;
         transaction.execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
         transaction.commit()?;
@@ -418,7 +446,15 @@ impl Ledger {
 
     fn migrate_v5_to_v6(&mut self) -> Result<()> {
         self.connection.pragma_update(None, "secure_delete", "ON")?;
-        let transaction = self.connection.transaction()?;
+        // This writer transaction serializes the privacy boundary with every
+        // already-active legacy writer. A legacy write either commits before
+        // this transaction and is scrubbed below, or runs after it and is
+        // rejected by the generation triggers installed atomically here.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        drop_privacy_write_guard_triggers(&transaction)?;
+        ensure_v6_storage_columns(&transaction)?;
         recreate_v6_identity_tables(&transaction)?;
         backfill_codex_event_identity_aliases(&transaction)?;
         rescrub_v5_private_values(&transaction)?;
@@ -431,6 +467,7 @@ impl Ledger {
                ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
             params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_PENDING],
         )?;
+        install_privacy_write_guard_triggers(&transaction)?;
         transaction.commit()?;
         self.complete_v6_privacy_cleanup()?;
         Ok(())
@@ -606,7 +643,7 @@ impl Ledger {
             .query_row(
                 r#"SELECT id, client, path, compressed, file_size, modified_ns,
                           checkpoint_offset, checkpoint_line, checkpoint_hash, head_hash,
-                          adapter_state
+                          adapter_state, content_hash
                    FROM source_files WHERE path=?1"#,
                 [path_key],
                 |row| {
@@ -624,6 +661,7 @@ impl Ledger {
                         checkpoint_hash: row.get(8)?,
                         head_hash: row.get(9)?,
                         adapter_state: serde_json::from_str(&state_text).unwrap_or_default(),
+                        content_hash: row.get(11)?,
                     })
                 },
             )
@@ -634,7 +672,7 @@ impl Ledger {
     pub fn ensure_source(&self, client: Client, path: &Path, compressed: bool) -> Result<i64> {
         let path_key = source_storage_key(path);
         self.connection.execute(
-            "INSERT INTO source_files(client, path, compressed) VALUES (?1, ?2, ?3) ON CONFLICT(path) DO UPDATE SET client=excluded.client, compressed=excluded.compressed",
+            "INSERT INTO source_files(client, path, compressed, privacy_write_generation) VALUES (?1, ?2, ?3, 1) ON CONFLICT(path) DO UPDATE SET client=excluded.client, compressed=excluded.compressed, privacy_write_generation=source_files.privacy_write_generation+1",
             params![client.as_str(), path_key, compressed as i64],
         )?;
         self.connection
@@ -705,7 +743,7 @@ impl Ledger {
         for warning in update.warnings {
             let warning = sanitize_scan_warning(warning);
             transaction.execute(
-                "INSERT INTO scan_warnings(scan_run_id, source_file_id, code, message, locator, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO scan_warnings(scan_run_id, source_file_id, code, message, locator, created_at, privacy_write_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
                 params![
                     update.scan_run_id,
                     update.source_id,
@@ -720,7 +758,8 @@ impl Ledger {
             r#"UPDATE source_files SET
                     file_size=?1, modified_ns=?2, checkpoint_offset=?3,
                     checkpoint_line=?4, checkpoint_hash=?5, head_hash=?6,
-                    adapter_state=?7, last_scan_at=?8, last_status=?9
+                    adapter_state=?7, last_scan_at=?8, last_status=?9,
+                    privacy_write_generation=privacy_write_generation+1
                 WHERE id=?10"#,
             params![
                 to_i64(update.file_size)?,
@@ -752,6 +791,19 @@ impl Ledger {
         Ok(())
     }
 
+    /// Store the exact physical-source digest after a source update commits.
+    /// A crash between these writes only leaves an empty/mismatched digest,
+    /// which forces a conservative rebuild on the next scan.
+    pub fn update_source_content_hash(&self, source_id: i64, content_hash: &str) -> Result<()> {
+        self.connection.execute(
+            r#"UPDATE source_files SET content_hash=?1,
+                    privacy_write_generation=privacy_write_generation+1
+               WHERE id=?2"#,
+            params![sanitize_hex_digest(content_hash), source_id],
+        )?;
+        Ok(())
+    }
+
     pub fn record_scan_warning(
         &self,
         scan_run_id: i64,
@@ -760,7 +812,7 @@ impl Ledger {
     ) -> Result<()> {
         let warning = sanitize_scan_warning(warning);
         self.connection.execute(
-            "INSERT INTO scan_warnings(scan_run_id, source_file_id, code, message, locator, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO scan_warnings(scan_run_id, source_file_id, code, message, locator, created_at, privacy_write_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
             params![
                 scan_run_id,
                 source_file_id,
@@ -1219,7 +1271,7 @@ impl Ledger {
         let mut statement = self.connection.prepare(
             r#"SELECT id, client, path, compressed, file_size, modified_ns,
                       checkpoint_offset, checkpoint_line, checkpoint_hash, head_hash,
-                      adapter_state
+                      adapter_state, content_hash
                FROM source_files ORDER BY client, path"#,
         )?;
         let rows = statement.query_map([], |row| {
@@ -1237,6 +1289,7 @@ impl Ledger {
                 checkpoint_hash: row.get(8)?,
                 head_hash: row.get(9)?,
                 adapter_state: serde_json::from_str(&state_text).unwrap_or_default(),
+                content_hash: row.get(11)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1284,8 +1337,8 @@ impl Ledger {
         transaction.execute(
             r#"INSERT INTO reconciliation_imports(
                    content_digest, source_kind, adapter, provider, imported_at,
-                   byte_count, bucket_count
-               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                   byte_count, bucket_count, privacy_write_generation
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)"#,
             params![
                 &content_digest,
                 &source_kind,
@@ -1454,6 +1507,183 @@ impl Ledger {
     }
 }
 
+fn ensure_v6_storage_columns(transaction: &Transaction<'_>) -> Result<()> {
+    let source_columns = table_columns(transaction, "source_files")?;
+    if !source_columns.contains("privacy_write_generation") {
+        transaction.execute_batch(
+            "ALTER TABLE source_files ADD COLUMN privacy_write_generation INTEGER NOT NULL DEFAULT 0;
+             UPDATE source_files SET privacy_write_generation=1;",
+        )?;
+    }
+    if !source_columns.contains("content_hash") {
+        transaction.execute_batch(
+            "ALTER TABLE source_files ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
+    let observation_columns = table_columns(transaction, "usage_observations")?;
+    if !observation_columns.contains("privacy_write_generation") {
+        transaction.execute_batch(
+            "ALTER TABLE usage_observations ADD COLUMN privacy_write_generation INTEGER NOT NULL DEFAULT 0;
+             UPDATE usage_observations SET privacy_write_generation=1;",
+        )?;
+    }
+    for table in ["scan_warnings", "reconciliation_imports"] {
+        let columns = table_columns(transaction, table)?;
+        if !columns.contains("privacy_write_generation") {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN privacy_write_generation INTEGER NOT NULL DEFAULT 0;
+                 UPDATE {table} SET privacy_write_generation=1;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn table_columns(transaction: &Transaction<'_>, table: &str) -> Result<HashSet<String>> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(Into::into)
+}
+
+fn drop_privacy_write_guard_triggers(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "DROP TRIGGER IF EXISTS guard_source_files_v6_insert;
+         DROP TRIGGER IF EXISTS guard_source_files_v6_update;
+         DROP TRIGGER IF EXISTS guard_usage_observations_v6_insert;
+         DROP TRIGGER IF EXISTS guard_usage_observations_v6_update;
+         DROP TRIGGER IF EXISTS guard_scan_warnings_v6_insert;
+         DROP TRIGGER IF EXISTS guard_scan_warnings_v6_update;
+         DROP TRIGGER IF EXISTS guard_reconciliation_imports_v6_insert;
+         DROP TRIGGER IF EXISTS guard_reconciliation_imports_v6_update;",
+    )?;
+    Ok(())
+}
+
+fn install_privacy_write_guard_triggers(transaction: &Transaction<'_>) -> Result<()> {
+    drop_privacy_write_guard_triggers(transaction)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TRIGGER guard_source_files_v6_insert
+        BEFORE INSERT ON source_files
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_source_files_v6_update
+        BEFORE UPDATE ON source_files
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_usage_observations_v6_insert
+        BEFORE INSERT ON usage_observations
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_usage_observations_v6_update
+        BEFORE UPDATE ON usage_observations
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_scan_warnings_v6_insert
+        BEFORE INSERT ON scan_warnings
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_scan_warnings_v6_update
+        BEFORE UPDATE ON scan_warnings
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_reconciliation_imports_v6_insert
+        BEFORE INSERT ON reconciliation_imports
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        CREATE TRIGGER guard_reconciliation_imports_v6_update
+        BEFORE UPDATE ON reconciliation_imports
+        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+             AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_private_database_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).mode(0o600);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to create database file {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure database file {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn prepare_private_database_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_sqlite_files(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        if candidate.try_exists().with_context(|| {
+            format!(
+                "failed to inspect sensitive database file {}",
+                candidate.display()
+            )
+        })? {
+            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("failed to secure database file {}", candidate.display())
+                })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+#[cfg(not(unix))]
+fn harden_sqlite_files(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn upsert_observation(
     transaction: &Transaction<'_>,
     source_id: i64,
@@ -1486,13 +1716,15 @@ fn upsert_observation(
                 output_tokens_total, reasoning_output_tokens,
                 web_search_requests, web_fetch_requests,
                 dimensions_json, quality_rank, coverage,
-                source_locator, parser_version, warnings_json
+                source_locator, parser_version, warnings_json,
+                privacy_write_generation
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23, ?24
+                ?19, ?20, ?21, ?22, ?23, ?24, 1
             )
             ON CONFLICT(source_file_id, event_key) DO UPDATE SET
+                privacy_write_generation = usage_observations.privacy_write_generation + 1,
                 session_id = CASE WHEN usage_observations.session_id='' THEN excluded.session_id ELSE usage_observations.session_id END,
                 provider_message_id = COALESCE(excluded.provider_message_id, usage_observations.provider_message_id),
                 occurred_at_utc = MIN(usage_observations.occurred_at_utc, excluded.occurred_at_utc),
@@ -2568,9 +2800,19 @@ fn sanitize_adapter_state(client: Client, value: &serde_json::Value) -> serde_js
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    for key in ["canonical_meta_seen", "auth_mode_inferred"] {
+    for key in [
+        "canonical_meta_seen",
+        "auth_mode_inferred",
+        "compressed_archive_unsupported",
+    ] {
         if let Some(value) = source.get(key).and_then(Value::as_bool) {
             safe.insert(key.to_string(), Value::Bool(value));
+        }
+    }
+    if let Some(value) = source.get("compressed_source_hash").and_then(Value::as_str) {
+        let value = sanitize_hex_digest(value);
+        if !value.is_empty() {
+            safe.insert("compressed_source_hash".to_string(), Value::String(value));
         }
     }
     for key in ["context_window", "epoch", "usage_event_index"] {
@@ -3429,6 +3671,9 @@ mod tests {
                 "physical_thread_id": THREAD,
                 "unknown_transcript_field": TRANSCRIPT
             });
+            ledger
+                .connection
+                .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])?;
             ledger.connection.execute(
                 r#"UPDATE usage_observations SET event_key=?1, session_id=?2,
                           provider_message_id=?3, dimensions_json=?4,
@@ -3464,9 +3709,6 @@ mod tests {
                 "INSERT INTO reconciliation_imports(content_digest, source_kind, adapter, provider, imported_at, byte_count, bucket_count) VALUES (?1, 'test_usage', 'test_adapter', 'openai', ?2, 1, 0)",
                 params![ACCOUNT, Utc::now().to_rfc3339()],
             )?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])?;
         }
 
         let ledger = Ledger::open(&database)?;
@@ -3627,6 +3869,9 @@ mod tests {
 
             // Recreate the prefix-trusting schema-v5 storage bug: both the
             // observation and parser state retained the provider lookalike.
+            ledger
+                .connection
+                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
             let legacy_state = serde_json::json!({
                 "canonical_meta_seen": true,
                 "logical_session_id": LOOKALIKE,
@@ -3640,9 +3885,6 @@ mod tests {
                 "UPDATE source_files SET adapter_state=?1 WHERE id=?2",
                 params![legacy_state.to_string(), source_id],
             )?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
         }
 
         let mut ledger = Ledger::open(&database)?;
@@ -3753,6 +3995,9 @@ mod tests {
                     "physical_thread_id": THREAD,
                     "usage_event_index": 1
                 });
+                ledger
+                    .connection
+                    .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
                 ledger.connection.execute(
                     r#"UPDATE source_files SET adapter_state=?1 WHERE id=?2"#,
                     params![crafted_state.to_string(), source_id],
@@ -3771,9 +4016,6 @@ mod tests {
                 )?;
             }
             ledger.finish_scan(run, 2, 2, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
         }
 
         let ledger = Ledger::open(&database)?;
@@ -3819,6 +4061,129 @@ mod tests {
     }
 
     #[test]
+    fn privacy_migration_serializes_live_legacy_writer_and_rejects_later_legacy_writes()
+    -> Result<()> {
+        const RAW_BEFORE: &str = "legacy-session-committed-before-migration";
+        const RAW_AFTER: &str = "legacy-session-attempted-after-migration";
+
+        let directory = tempdir()?;
+        let database = directory.path().join("mixed-version-race.sqlite");
+        let source_path = directory.path().join("source.jsonl");
+        {
+            let mut ledger = Ledger::open(&database)?;
+            let run = ledger.start_scan("test")?;
+            let source_id = ledger.ensure_source(Client::ClaudeCode, &source_path, false)?;
+            let value = observation("initial", 1, 2);
+            ledger.apply_source_update(SourceUpdate {
+                source_id,
+                reset_observations: false,
+                file_size: 1,
+                modified_ns: 1,
+                checkpoint_offset: 1,
+                checkpoint_line: 1,
+                checkpoint_hash: "",
+                head_hash: "",
+                adapter_state: &serde_json::Value::Null,
+                observations: &[value],
+                warnings: &[],
+                scan_run_id: run,
+            })?;
+            ledger.finish_scan(run, 1, 1, 0, "ok")?;
+            ledger
+                .connection
+                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+        }
+
+        // This connection represents v0.3: it opened the old schema before
+        // v0.4 began and does not know about the v0.4 scan lease or generation
+        // columns. Its in-flight write must commit before migration can begin.
+        let legacy = Connection::open(&database)?;
+        legacy.busy_timeout(std::time::Duration::from_secs(5))?;
+        legacy.execute_batch("BEGIN IMMEDIATE")?;
+        legacy.execute("UPDATE usage_observations SET session_id=?1", [RAW_BEFORE])?;
+
+        let migration_database = database.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let migration = std::thread::spawn(move || -> Result<()> {
+            started_sender.send(()).expect("migration start signal");
+            drop(Ledger::open(&migration_database)?);
+            done_sender.send(()).expect("migration completion signal");
+            Ok(())
+        });
+        started_receiver.recv()?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            matches!(
+                done_receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "migration must not pass a live legacy writer transaction"
+        );
+        legacy.execute_batch("COMMIT")?;
+        migration.join().expect("migration thread")?;
+        done_receiver.recv()?;
+
+        let stored: String = legacy.query_row(
+            "SELECT session_id FROM usage_observations LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stored,
+            pseudonymous_session_id(Client::ClaudeCode, RAW_BEFORE),
+            "the legacy write committed before the exclusive migration must be scrubbed"
+        );
+
+        let error = legacy
+            .execute("UPDATE usage_observations SET session_id=?1", [RAW_AFTER])
+            .expect_err("an already-open legacy connection must be rejected after migration");
+        assert!(error.to_string().contains("privacy generation guard"));
+        let error = legacy
+            .execute(
+                "UPDATE source_files SET adapter_state=?1",
+                [r#"{"logical_session_id":"raw-after-migration"}"#],
+            )
+            .expect_err("legacy parser-state writes must also be rejected after migration");
+        assert!(error.to_string().contains("privacy generation guard"));
+        let stored: String = legacy.query_row(
+            "SELECT session_id FROM usage_observations LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(!stored.contains(RAW_AFTER));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_open_hardens_database_directory_and_sqlite_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let app_dir = directory.path().join("token-ledger");
+        std::fs::create_dir(&app_dir)?;
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o777))?;
+        let database = app_dir.join("ledger.sqlite3");
+        let _ledger = Ledger::open(&database)?;
+
+        assert_eq!(
+            std::fs::metadata(&app_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        for path in [
+            database.clone(),
+            sqlite_sidecar_path(&database, "-wal"),
+            sqlite_sidecar_path(&database, "-shm"),
+        ] {
+            if path.try_exists()? {
+                assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pending_v6_physical_cleanup_retries_without_rehashing_rows() -> Result<()> {
         const LOOKALIKE: &str = "tlses_eeeeeeeeeeeeeeeeeeeeeeee";
 
@@ -3848,10 +4213,10 @@ mod tests {
             ledger.finish_scan(run, 1, 1, 0, "ok")?;
             ledger
                 .connection
-                .execute("UPDATE usage_observations SET session_id=?1", [LOOKALIKE])?;
+                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
             ledger
                 .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+                .execute("UPDATE usage_observations SET session_id=?1", [LOOKALIKE])?;
             ledger
                 .connection
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -4718,6 +5083,9 @@ mod tests {
             })?;
 
             // Recreate the privacy-relevant shape of a schema-v1 ledger.
+            ledger
+                .connection
+                .execute("UPDATE meta SET value='1' WHERE key='schema_version'", [])?;
             ledger.connection.execute(
                 "UPDATE source_files SET path=?1 WHERE id=?2",
                 params![source_path.to_string_lossy(), source_id],
@@ -4728,9 +5096,6 @@ mod tests {
                     "C:\\users\\private\\{PRIVATE_PATH}\\session.jsonl:line 9 @ byte 42"
                 )],
             )?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='1' WHERE key='schema_version'", [])?;
         }
 
         let ledger = Ledger::open(&database)?;

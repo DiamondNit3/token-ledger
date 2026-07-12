@@ -2,8 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -53,6 +55,11 @@ const CLI_STYLES: ClapStyles = ClapStyles::styled()
     .usage(ClapColor::Cyan.on_default().bold())
     .literal(ClapColor::Green.on_default().bold())
     .placeholder(ClapColor::Yellow.on_default());
+
+const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
+const CATALOG_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const CATALOG_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const MAX_CATALOG_REDIRECTS: usize = 5;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -2611,15 +2618,69 @@ fn display_scan_mode(value: &str) -> &str {
 
 fn read_update_source(source: &str) -> Result<Vec<u8>> {
     if source.starts_with("https://") {
-        let response = reqwest::blocking::get(source)
-            .with_context(|| format!("failed to download catalog from {source}"))?
-            .error_for_status()?;
-        Ok(response.bytes()?.to_vec())
+        let url = reqwest::Url::parse(source).context("invalid HTTPS catalog URL")?;
+        anyhow::ensure!(url.scheme() == "https", "catalog updates require HTTPS");
+        let redirect = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() != "https" {
+                attempt.error("catalog redirects must remain on HTTPS")
+            } else if attempt.previous().len() >= MAX_CATALOG_REDIRECTS {
+                attempt.error("catalog redirect limit exceeded")
+            } else {
+                attempt.follow()
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .https_only(true)
+            .connect_timeout(CATALOG_CONNECT_TIMEOUT)
+            .timeout(CATALOG_REQUEST_TIMEOUT)
+            .redirect(redirect)
+            .build()
+            .context("failed to initialize the catalog HTTP client")?;
+        let mut response = client.get(url).send().map_err(|error| {
+            anyhow::anyhow!(
+                "catalog download failed or timed out: {}",
+                error.without_url()
+            )
+        })?;
+        let status = response.status();
+        anyhow::ensure!(status.is_success(), "catalog server returned HTTP {status}");
+        if let Some(length) = response.content_length() {
+            anyhow::ensure!(
+                length <= MAX_CATALOG_BYTES,
+                "catalog exceeds the {} MiB download limit",
+                MAX_CATALOG_BYTES / (1024 * 1024)
+            );
+        }
+        read_bounded(&mut response, "downloaded catalog")
     } else if source.starts_with("http://") {
         anyhow::bail!("catalog updates require HTTPS or a local file")
     } else {
-        std::fs::read(source).with_context(|| format!("failed to read catalog {source}"))
+        let mut file = std::fs::File::open(source).context("failed to open local catalog")?;
+        let length = file
+            .metadata()
+            .context("failed to inspect local catalog")?
+            .len();
+        anyhow::ensure!(
+            length <= MAX_CATALOG_BYTES,
+            "local catalog exceeds the {} MiB size limit",
+            MAX_CATALOG_BYTES / (1024 * 1024)
+        );
+        read_bounded(&mut file, "local catalog")
     }
+}
+
+fn read_bounded(reader: &mut impl std::io::Read, label: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity((MAX_CATALOG_BYTES.min(64 * 1024)) as usize);
+    reader
+        .take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label}"))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_CATALOG_BYTES,
+        "{label} exceeds the {} MiB size limit",
+        MAX_CATALOG_BYTES / (1024 * 1024)
+    );
+    Ok(bytes)
 }
 
 fn load_catalog_candidate(
@@ -2975,5 +3036,26 @@ mod tests {
             };
             assert!(args.full);
         }
+    }
+
+    #[test]
+    fn local_catalog_size_is_bounded_before_reading() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("oversized.json");
+        let file = std::fs::File::create(&path)?;
+        file.set_len(MAX_CATALOG_BYTES + 1)?;
+
+        let error = read_update_source(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("size limit"));
+        assert!(!error.to_string().contains(path.to_str().unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_reader_rejects_streams_past_the_limit() {
+        let mut reader = std::io::repeat(0).take(MAX_CATALOG_BYTES + 1);
+        let error = read_bounded(&mut reader, "test catalog").unwrap_err();
+        assert!(error.to_string().contains("size limit"));
     }
 }

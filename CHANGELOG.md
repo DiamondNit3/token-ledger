@@ -6,6 +6,26 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 No changes yet.
 
+## 0.4.1 - 2026-07-12
+
+### Fixed
+
+- Prevented older Token Ledger processes from reintroducing raw identifiers after the schema-v6 privacy migration.
+- Made oversized compressed session archives fail with an explicit unsupported-limit warning instead of promising progress that could never reach the suffix.
+- Strengthened large-file rewrite detection with a complete digest accumulated during parsing.
+- Bounded catalog files and downloads to 8 MiB, added connection and overall timeouts, limited redirects, and rejected every non-HTTPS network hop.
+- Corrected the minimum-Rust CI job so it explicitly installs Rust 1.88.0.
+- Hardened private application directories and sensitive database/configuration files on Unix.
+
+### Security
+
+- Required release tags to point to commits reachable from `main` and routed release publication through the protected `release` environment.
+- Added code ownership for release, CI, dependency-update, and security-policy changes.
+
+### Upgrade note
+
+Before upgrading from 0.3.x or earlier, terminate every older `token-ledger` process. Version 0.4.1 rejects unsafe mixed-version writes, but an already-running older binary cannot protect a database until the fixed version has opened and upgraded it.
+
 ## 0.4.0 - 2026-07-12
 
 ### Added
