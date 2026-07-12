@@ -1,6 +1,6 @@
 [package]
 name = "token-ledger"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Local-first Claude Code and OpenAI Codex token usage ledger"
@@ -51,6 +51,7 @@ directories = "6.0"
 hex = "0.4"
 iana-time-zone = "0.1"
 indicatif = "0.18"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 rust_decimal = { version = "1.36", features = ["serde", "serde-with-str"] }

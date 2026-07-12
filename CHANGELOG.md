@@ -6,6 +6,25 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 No changes yet.
 
+## 0.4.2 - 2026-07-12
+
+### Fixed
+
+- Added a schema-v7 privacy barrier that invalidates pre-barrier schema-v6 accounting caches instead of trusting potentially contaminated rows or double-hashing legitimate pseudonyms.
+- Acquired one exclusive migration transaction before reading the schema version, advanced every version with compare-and-swap checks, and rejected schema-marker downgrades or deletion at the database boundary.
+- Made every incomplete compressed parse all-or-nothing, including oversized-line, truncated-tail, adapter-gap, record, observation, warning, byte, and decompression failures.
+- Revalidated aggregate work from the safely opened source handle and lowered the explicit physical source ceiling to 128 MiB so every admitted source fits the 2 GiB invocation budget.
+- Opened sources without following final-component Unix symlinks or Windows reparse points and retained the verified handle through fingerprinting, checkpoint validation, and parsing.
+
+### Repository
+
+- Made CODEOWNERS own itself, corrected public-repository documentation, and reclassified v0.4.1 as a prelaunch security patch.
+- Closed the Rust-1.88-incompatible rusqlite dependency update without merging it.
+
+### Upgrade note
+
+Before upgrading from any earlier Token Ledger version, including v0.4.0 and v0.4.1, terminate every older `token-ledger` process. The first v0.4.2 open invalidates schema-v6 source, observation, warning, and reconciliation caches so the next scan can rebuild identifier-bearing accounting from authoritative local sources. Re-import any provider reconciliation exports afterward.
+
 ## 0.4.1 - 2026-07-12
 
 ### Fixed
@@ -24,7 +43,7 @@ No changes yet.
 
 ### Upgrade note
 
-Before upgrading from 0.3.x or earlier, terminate every older `token-ledger` process. Version 0.4.1 rejects unsafe mixed-version writes, but an already-running older binary cannot protect a database until the fixed version has opened and upgraded it.
+Before upgrading from any earlier Token Ledger version, including v0.4.0, terminate every older `token-ledger` process. Version 0.4.1 rejects new unsafe mixed-version writes, but an already-running older binary cannot protect a database until the fixed version has opened and upgraded it.
 
 ## 0.4.0 - 2026-07-12
 
