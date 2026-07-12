@@ -177,6 +177,7 @@ struct InitArgs {
     /// IANA timezone stored in the new configuration.
     #[arg(long)]
     tz: Option<String>,
+    /// Rewrite an existing configuration file; the database itself is not purged.
     #[arg(long)]
     force: bool,
 }
@@ -211,6 +212,7 @@ struct DayArgs {
     /// Override the configured IANA timezone for this command.
     #[arg(long)]
     tz: Option<String>,
+    /// Query the current ledger without refreshing local session sources first.
     #[arg(long)]
     no_scan: bool,
     #[command(flatten)]
@@ -224,6 +226,7 @@ struct TodayArgs {
     /// Override the configured IANA timezone for this command.
     #[arg(long)]
     tz: Option<String>,
+    /// Query the current ledger without refreshing local session sources first.
     #[arg(long)]
     no_scan: bool,
     #[command(flatten)]
@@ -293,8 +296,10 @@ struct RangeArgs {
     /// Override the configured IANA timezone for this command.
     #[arg(long)]
     tz: Option<String>,
+    /// Comma-separated grouping dimensions: day, client, model, or session.
     #[arg(long, default_value = "day,client,model")]
     group_by: String,
+    /// Query the current ledger without refreshing local session sources first.
     #[arg(long)]
     no_scan: bool,
     #[command(flatten)]
@@ -311,6 +316,7 @@ struct SessionsArgs {
     /// Override the configured IANA timezone for this command.
     #[arg(long)]
     tz: Option<String>,
+    /// Query the current ledger without refreshing local session sources first.
     #[arg(long)]
     no_scan: bool,
     #[command(flatten)]
@@ -501,12 +507,16 @@ struct ExportArgs {
     /// Override the configured IANA timezone for this command.
     #[arg(long)]
     tz: Option<String>,
+    /// Comma-separated grouping dimensions: day, client, model, or session.
     #[arg(long, default_value = "day,client,model")]
     group_by: String,
+    /// Export format written to --output or standard output.
     #[arg(long, value_enum, default_value = "json")]
     format: ExportFormat,
+    /// Destination file; omit to write the export to standard output.
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Export the current ledger without refreshing local session sources first.
     #[arg(long)]
     no_scan: bool,
     #[command(flatten)]
@@ -515,6 +525,7 @@ struct ExportArgs {
 
 #[derive(Debug, Args)]
 struct PurgeArgs {
+    /// Confirm permanent removal of Token Ledger's local accounting index.
     #[arg(long)]
     yes: bool,
 }
