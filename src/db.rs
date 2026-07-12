@@ -116,6 +116,12 @@ impl Ledger {
         journal_mode: &str,
         allow_v6_invalidation: bool,
     ) -> Result<Self> {
+        // journal_mode is persistent database state. Refuse unrelated or
+        // unversioned populated SQLite files before selecting WAL so an
+        // accidental --db target is not modified merely by being opened.
+        // migrate repeats this check under its EXCLUSIVE lock to close the
+        // race between this read-only identity check and migration.
+        reject_unversioned_database_objects(&connection)?;
         connection.pragma_update(None, "journal_mode", journal_mode)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "busy_timeout", 5_000_i64)?;
@@ -129,7 +135,18 @@ impl Ledger {
     }
 
     fn migrate(&mut self, allow_v6_invalidation: bool) -> Result<()> {
-        self.connection.execute_batch(
+        // Take the migration lock before inspecting or creating schema
+        // objects. In particular, an unrelated or damaged database must be
+        // rejected without bootstrap CREATE TABLE statements mutating it.
+        self.connection.pragma_update(None, "secure_delete", "ON")?;
+        let mut needs_physical_cleanup = false;
+        let mut cleanup_follower = false;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        reject_unversioned_database_objects(&transaction)?;
+
+        transaction.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -273,17 +290,10 @@ impl Ledger {
             "#,
         )?;
 
-        // secure_delete must be selected outside a transaction. The EXCLUSIVE
-        // transaction is then acquired *before* reading schema_version and is
-        // retained across every logical migration. A second upgrader therefore
-        // observes the first upgrader's committed version instead of replaying
-        // the same pseudonymization boundary.
-        self.connection.pragma_update(None, "secure_delete", "ON")?;
-        let mut needs_physical_cleanup = false;
-        let mut cleanup_follower = false;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        // The EXCLUSIVE transaction was acquired before both bootstrap and
+        // schema inspection and is retained across every logical migration. A
+        // second upgrader therefore observes the first upgrader's committed
+        // version instead of replaying the same pseudonymization boundary.
         let existing: Option<i64> = transaction
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
@@ -1497,9 +1507,48 @@ impl Ledger {
     }
 }
 
+/// Rejects a populated SQLite file before Token Ledger's bootstrap schema can
+/// mutate it unless a supported ledger schema version can be proven. A valid,
+/// versioned ledger may contain user-defined views; those objects are only
+/// suspicious when the database has no trustworthy generation marker.
+fn reject_unversioned_database_objects(connection: &Connection) -> Result<()> {
+    let user_objects: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM sqlite_schema
+         WHERE type IN ('table', 'view')
+           AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if user_objects == 0 {
+        return Ok(());
+    }
+
+    let version = connection
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional();
+    if matches!(version, Ok(Some(1..=SCHEMA_VERSION))) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "database schema metadata is missing or invalid but existing user tables or views were \
+         found. Refusing to modify or mark this database privacy-safe. Restore the database \
+         (including its WAL state) from a known-good backup, or move this database aside and \
+         deliberately create and rebuild a new ledger"
+    )
+}
+
 /// Returns true when a database without `schema_version` cannot be proven
-/// fresh. Every table in this query is created before migration starts, so the
-/// check is safe for both a brand-new file and a partially damaged ledger.
+/// fresh. Expected tables are created before migration starts, so checking
+/// their contents is safe for both a brand-new file and a partially damaged
+/// ledger. Unexpected user tables or views are also retained state: they may
+/// be renamed damaged ledger objects containing identifiers, or evidence that
+/// the user accidentally selected an unrelated SQLite database.
 fn database_has_existing_state(transaction: &Transaction<'_>) -> Result<bool> {
     const STATE_TABLES: &[&str] = &[
         "source_files",
@@ -1512,6 +1561,22 @@ fn database_has_existing_state(transaction: &Transaction<'_>) -> Result<bool> {
         "reconciliation_buckets",
         "meta",
     ];
+
+    let mut objects = transaction.prepare(
+        "SELECT type, name
+         FROM sqlite_schema
+         WHERE type IN ('table', 'view')
+           AND name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+    )?;
+    let mut rows = objects.query([])?;
+    while let Some(row) = rows.next()? {
+        let object_type: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        if object_type == "view" || !STATE_TABLES.contains(&name.as_str()) {
+            return Ok(true);
+        }
+    }
 
     for table in STATE_TABLES {
         let query = format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)");
@@ -4349,7 +4414,7 @@ mod tests {
             .err()
             .context("ordinary open must reject populated databases with missing metadata")?;
         assert!(error.to_string().contains("schema metadata is missing"));
-        assert!(error.to_string().contains("Refusing to mark"));
+        assert!(error.to_string().contains("Refusing to modify or mark"));
 
         let error = Ledger::open_for_v6_privacy_migration(&database)
             .err()
@@ -4369,6 +4434,144 @@ mod tests {
     }
 
     #[test]
+    fn missing_schema_metadata_with_renamed_state_fails_closed() -> Result<()> {
+        const RAW_PATH: &str = "C:\\Users\\alice\\.claude\\projects\\private-session.jsonl";
+
+        let directory = tempdir()?;
+        let database = directory.path().join("renamed-damaged-table.sqlite");
+        {
+            let ledger = Ledger::open(&database)?;
+            ledger.connection.execute(
+                "INSERT INTO source_files(client, path, privacy_write_generation) \
+                 VALUES ('claude_code', ?1, 1)",
+                [RAW_PATH],
+            )?;
+            ledger.connection.execute_batch(
+                "DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_replace;
+                 ALTER TABLE source_files RENAME TO source_files_damaged;
+                 DELETE FROM meta;",
+            )?;
+        }
+
+        let error = Ledger::open(&database)
+            .err()
+            .context("ordinary open must reject renamed ledger state with missing metadata")?;
+        assert!(error.to_string().contains("schema metadata is missing"));
+        assert!(error.to_string().contains("Refusing to modify or mark"));
+
+        let connection = Connection::open(&database)?;
+        let raw_path: String =
+            connection.query_row("SELECT path FROM source_files_damaged LIMIT 1", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            raw_path, RAW_PATH,
+            "failed open must preserve renamed state"
+        );
+        let replacement_source_table: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='table' AND name='source_files'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            replacement_source_table, 0,
+            "failed preflight must not create a replacement source_files table"
+        );
+        let metadata_rows: i64 =
+            connection.query_row("SELECT COUNT(*) FROM meta", [], |row| row.get(0))?;
+        assert_eq!(
+            metadata_rows, 0,
+            "the replacement table must not be blessed with schema/privacy metadata"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_schema_metadata_rejects_unrelated_sqlite_objects() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("unrelated.sqlite");
+        let original_journal_mode = {
+            let connection = Connection::open(&database)?;
+            connection.execute_batch(
+                "CREATE TABLE application_records(id INTEGER PRIMARY KEY, secret TEXT);
+                 CREATE VIEW application_record_ids AS SELECT id FROM application_records;",
+            )?;
+            connection.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?
+        };
+
+        let error = Ledger::open(&database)
+            .err()
+            .context("an unrelated SQLite database must not be initialized as a ledger")?;
+        assert!(error.to_string().contains("schema metadata is missing"));
+
+        let connection = Connection::open(&database)?;
+        let unrelated_objects: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE name IN ('application_records', 'application_record_ids')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            unrelated_objects, 2,
+            "failed open must preserve unrelated objects"
+        );
+        let metadata_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='table'
+               AND name IN ('meta', 'source_files', 'usage_observations', 'scan_runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            metadata_rows, 0,
+            "failed preflight must not create Token Ledger tables"
+        );
+        let journal_mode: String =
+            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        assert_eq!(
+            journal_mode, original_journal_mode,
+            "read-only identity refusal must not persist a new journal mode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_schema_metadata_rejects_unexpected_view_without_table_state() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("unexpected-view.sqlite");
+        {
+            let connection = Connection::open(&database)?;
+            connection
+                .execute_batch("CREATE VIEW retained_state AS SELECT 'raw-value' AS value")?;
+        }
+
+        let error = Ledger::open(&database)
+            .err()
+            .context("an unexpected user view must prevent fresh-ledger initialization")?;
+        assert!(error.to_string().contains("schema metadata is missing"));
+
+        let connection = Connection::open(&database)?;
+        let retained: String =
+            connection.query_row("SELECT value FROM retained_state", [], |row| row.get(0))?;
+        assert_eq!(retained, "raw-value");
+        let metadata_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='table'
+               AND name IN ('meta', 'source_files', 'usage_observations', 'scan_runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            metadata_rows, 0,
+            "failed preflight must not create Token Ledger tables"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn missing_schema_metadata_is_initialized_only_when_database_is_empty() -> Result<()> {
         let directory = tempdir()?;
         let database = directory.path().join("fresh.sqlite");
@@ -4384,6 +4587,28 @@ mod tests {
         )?;
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(state_rows, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_versioned_database_preserves_user_views() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("versioned-with-view.sqlite");
+        {
+            let ledger = Ledger::open(&database)?;
+            ledger.connection.execute_batch(
+                "CREATE VIEW user_usage_summary AS
+                 SELECT COUNT(*) AS observation_count FROM usage_observations;",
+            )?;
+        }
+
+        let ledger = Ledger::open(&database)?;
+        let observation_count: i64 = ledger.connection.query_row(
+            "SELECT observation_count FROM user_usage_summary",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(observation_count, 0);
         Ok(())
     }
 

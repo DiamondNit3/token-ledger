@@ -254,7 +254,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
+      attestations: write
       contents: write
+      id-token: write
 
     steps:
       - name: Check out source
@@ -365,6 +367,14 @@ jobs:
             sha256sum --check SHA256SUMS.txt
           )
 
+      - name: Attest release provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+
       - name: Publish release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
@@ -379,6 +389,7 @@ jobs:
             - The macOS binaries are **unsigned and not notarized**. macOS may require explicit approval before first launch.
             - The Windows binary is **unsigned** and may trigger Microsoft Defender SmartScreen.
             - Verify the downloaded archive against `SHA256SUMS.txt` before extraction. On Linux run `sha256sum --check SHA256SUMS.txt`; on macOS run `shasum -a 256 --check SHA256SUMS.txt`; on Windows compute `Get-FileHash <archive> -Algorithm SHA256` and compare it with the matching entry.
+            - Verify the archive's signed GitHub build-provenance attestation with `gh attestation verify <archive> -R DiamondNit3/token-ledger`. The attestation identifies the source workflow and commit; it does not make the Windows or macOS executable platform-signed.
           fail_on_unmatched_files: true
           overwrite_files: false
           files: |

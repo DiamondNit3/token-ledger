@@ -69,7 +69,15 @@ The release workflow builds these native targets:
 - `x86_64-apple-darwin` (`.tar.gz`); and
 - `aarch64-apple-darwin` (`.tar.gz`).
 
-macOS artifacts are currently unsigned and not notarized. Windows artifacts are also unsigned. The workflow prepends both disclosures and checksum-verification instructions to every generated GitHub release note until signing is implemented.
+macOS artifacts are currently unsigned and not notarized. Windows artifacts are also unsigned. Release tags are required to be annotated, but they are not required to carry a maintainer cryptographic signature. The workflow prepends these disclosures and verification instructions to every generated GitHub release note until platform and tag signing are implemented.
+
+The release workflow creates a Sigstore-signed GitHub build-provenance attestation for the four archives and `SHA256SUMS.txt`. This binds their digests to the repository, source commit, and release workflow; it does not platform-sign the executables or prove that their contents are safe. Verify a downloaded archive with:
+
+```bash
+gh attestation verify token-ledger-vX.Y.Z-TARGET.ARCHIVE -R DiamondNit3/token-ledger
+```
+
+The release does not currently publish an SPDX or CycloneDX SBOM. `THIRD-PARTY-NOTICES.html` is a reproducible dependency-license inventory tied to `Cargo.lock`, not an SBOM. Add an SBOM only after its target-specific contents and release verification are covered by the package contract.
 
 ## 6. Verify from extraction
 
@@ -112,7 +120,7 @@ git tag -a v0.4.0 -m "Token Ledger v0.4.0"
 git push origin v0.4.0
 ```
 
-A signed tag is also accepted because it is annotated. Lightweight tags are rejected. Before publication, the release job requires exactly one changelog heading for the tag version with an ISO `YYYY-MM-DD` date. The tag push starts publication; manual dispatch never publishes. The release job also refuses to update or replace an existing GitHub release for that tag.
+A cryptographically signed tag is also accepted because it is annotated; an ordinary annotated tag is not a signed tag. Lightweight tags are rejected. Before publication, the release job requires exactly one changelog heading for the tag version with an ISO `YYYY-MM-DD` date. The tag push starts publication; manual dispatch never publishes. The release job also refuses to update or replace an existing GitHub release for that tag.
 
 Download the resulting release assets, verify `SHA256SUMS.txt` independently, and smoke-test the extracted executable on each platform before announcing it.
 

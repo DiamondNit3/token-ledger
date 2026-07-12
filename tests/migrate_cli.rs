@@ -118,6 +118,57 @@ fn migrate_reports_cleanup_failure_while_a_wal_reader_is_live() {
 }
 
 #[test]
+fn models_rejects_a_renamed_damaged_table_before_bootstrap() {
+    let fixture = MigrationFixture::create();
+    fixture.initialize();
+
+    let connection =
+        Connection::open(&fixture.configured_database).expect("open initialized ledger");
+    connection
+        .execute(
+            "INSERT INTO source_files(client, path, privacy_write_generation) VALUES ('claude_code', 'Z:/private/raw-session.jsonl', 1)",
+            [],
+        )
+        .expect("insert raw path");
+    connection
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+             DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+             DROP TRIGGER IF EXISTS guard_schema_version_no_replace;
+             ALTER TABLE source_files RENAME TO source_files_damaged;
+             DELETE FROM meta;",
+        )
+        .expect("damage schema metadata");
+    drop(connection);
+
+    let output = fixture
+        .command()
+        .arg("--db")
+        .arg(&fixture.configured_database)
+        .args(["models", "--json"])
+        .output()
+        .expect("run models against damaged database");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("schema metadata is missing or invalid"));
+
+    let connection = Connection::open(&fixture.configured_database).expect("reopen damaged ledger");
+    let retained: String = connection
+        .query_row("SELECT path FROM source_files_damaged", [], |row| {
+            row.get(0)
+        })
+        .expect("read retained raw path");
+    assert_eq!(retained, "Z:/private/raw-session.jsonl");
+    let replacement_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='source_files'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check replacement table");
+    assert_eq!(replacement_count, 0);
+}
+
+#[test]
 fn important_confirmation_scan_and_export_flags_have_help_text() {
     let cases = [
         (

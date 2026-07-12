@@ -6,6 +6,22 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 No changes yet.
 
+## 0.4.5 - 2026-07-12
+
+### Security
+
+- Added an exclusive pre-bootstrap schema inspection that rejects unversioned databases containing any user table or view before Token Ledger creates or stamps schema objects.
+- Covered renamed damaged tables, unrelated SQLite databases, view-only databases, and normal versioned ledgers with user views; rejected files remain unmodified and retain their evidence.
+- Added Sigstore-backed GitHub build-provenance attestations for all four release archives and `SHA256SUMS.txt` while retaining the existing checksum verification.
+
+### Repository
+
+- Removed the stale undeclared toolchain input from the pinned Rust 1.88 action; the immutable action revision continues to install 1.88.0 without emitting the warning.
+- Closed Dependabot PRs #2 and #3 unchanged because their dependency graphs lacked regenerated and reviewed third-party notices.
+- Deleted merged feature and security branches from the local and public repository.
+- Marked the two-independent-install launch gate as unmet instead of inferring success from download counts or maintainer smoke tests.
+- Clarified that release tags and platform binaries remain unsigned, provenance attestations are not platform signatures, and the project does not yet publish an SPDX or CycloneDX SBOM.
+
 ## 0.4.4 - 2026-07-12
 
 ### Security
