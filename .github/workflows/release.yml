@@ -370,6 +370,10 @@ jobs:
         with:
           generate_release_notes: true
           body: |
+            ## Required v0.4.1 upgrade step
+
+            If this release opens a v0.4.1-era ledger, first retain the original Claude Code and Codex session files and export or back up the v0.4.1 database. The privacy barrier deletes cached observations, scan history, warnings, and reconciliation imports; accounting whose original source has expired or been deleted cannot be rebuilt. Run `token-ledger migrate --accept-history-loss`, then `token-ledger scan --rebuild` and re-import reconciliation exports. Ordinary commands fail closed until migration is explicitly authorized.
+
             ## Binary trust and checksum verification
 
             - The macOS binaries are **unsigned and not notarized**. macOS may require explicit approval before first launch.

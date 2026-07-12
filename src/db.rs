@@ -78,6 +78,18 @@ pub struct LedgerStats {
 
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_v6_invalidation(path, false)
+    }
+
+    /// Opens a ledger while explicitly allowing the schema-v6 privacy barrier
+    /// to invalidate cached accounting. Callers must obtain deliberate user
+    /// consent first: history whose original source files are gone cannot be
+    /// rebuilt after this migration.
+    pub fn open_for_v6_privacy_migration(path: &Path) -> Result<Self> {
+        Self::open_with_v6_invalidation(path, true)
+    }
+
+    fn open_with_v6_invalidation(path: &Path, allow_v6_invalidation: bool) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
             create_private_dir_all(parent).with_context(|| {
                 format!("failed to create database directory {}", parent.display())
@@ -87,22 +99,28 @@ impl Ledger {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open ledger database {}", path.display()))?;
         harden_sqlite_files(path)?;
-        let ledger = Self::from_connection(connection, path.to_path_buf(), "WAL")?;
+        let ledger =
+            Self::from_connection(connection, path.to_path_buf(), "WAL", allow_v6_invalidation)?;
         harden_sqlite_files(path)?;
         Ok(ledger)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory().context("failed to open in-memory ledger")?;
-        Self::from_connection(connection, PathBuf::from(":memory:"), "MEMORY")
+        Self::from_connection(connection, PathBuf::from(":memory:"), "MEMORY", true)
     }
 
-    fn from_connection(connection: Connection, path: PathBuf, journal_mode: &str) -> Result<Self> {
+    fn from_connection(
+        connection: Connection,
+        path: PathBuf,
+        journal_mode: &str,
+        allow_v6_invalidation: bool,
+    ) -> Result<Self> {
         connection.pragma_update(None, "journal_mode", journal_mode)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "busy_timeout", 5_000_i64)?;
         let mut ledger = Self { connection, path };
-        ledger.migrate()?;
+        ledger.migrate(allow_v6_invalidation)?;
         Ok(ledger)
     }
 
@@ -110,7 +128,7 @@ impl Ledger {
         &self.path
     }
 
-    fn migrate(&mut self) -> Result<()> {
+    fn migrate(&mut self, allow_v6_invalidation: bool) -> Result<()> {
         self.connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS meta (
@@ -291,6 +309,16 @@ impl Ledger {
             }
             Some(version @ 1..=6) => {
                 let opened_at_v6 = version == 6;
+                if opened_at_v6 && !allow_v6_invalidation {
+                    anyhow::bail!(
+                        "opening this v0.4.1-era ledger requires an explicit privacy migration. \
+                         The migration permanently deletes cached observations, scan history, warnings, \
+                         and reconciliation imports; history cannot be rebuilt when its original Claude \
+                         Code or Codex source files are missing. Retain those source files and export or \
+                         back up the v0.4.1 ledger first, then run `token-ledger migrate \
+                         --accept-history-loss`"
+                    );
+                }
                 let mut current = version;
                 if current == 1 {
                     migrate_v1_to_v2(&transaction)?;
@@ -4303,7 +4331,25 @@ mod tests {
             transaction.commit()?;
         }
 
-        let ledger = Ledger::open(&database)?;
+        let error = match Ledger::open(&database) {
+            Ok(_) => anyhow::bail!("a pre-barrier v6 ledger migrated without authorization"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("explicit privacy migration"));
+        assert!(error.to_string().contains("source files are missing"));
+        let untouched = Connection::open(&database)?;
+        let (sources, observations): (i64, i64) = untouched.query_row(
+            "SELECT (SELECT COUNT(*) FROM source_files), (SELECT COUNT(*) FROM usage_observations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((sources, observations), (1, 1));
+        drop(untouched);
+
+        // The fixture never creates its source path. Once the explicitly
+        // authorized privacy barrier invalidates this cache, that historical
+        // accounting cannot be reconstructed from disk.
+        let ledger = Ledger::open_for_v6_privacy_migration(&database)?;
         let (version, barrier, sources, observations): (i64, String, i64, i64) =
             ledger.connection.query_row(
                 r#"SELECT

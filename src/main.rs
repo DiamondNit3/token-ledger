@@ -142,6 +142,8 @@ enum Command {
     Demo,
     /// Create configuration and initialize the database.
     Init(InitArgs),
+    /// Deliberately cross a destructive privacy-migration boundary.
+    Migrate(MigrateArgs),
     /// Inspect source discovery, coverage, and catalog health without exposing transcript content.
     Doctor,
     /// Incrementally scan locally persisted sessions.
@@ -177,6 +179,13 @@ struct InitArgs {
     tz: Option<String>,
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+struct MigrateArgs {
+    /// Confirm that cached history may be permanently lost when original source files are absent.
+    #[arg(long)]
+    accept_history_loss: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -595,6 +604,7 @@ fn run() -> Result<()> {
     match command {
         Command::Demo => unreachable!("demo returns before configuration is loaded"),
         Command::Init(args) => command_init(config, &config_path, args),
+        Command::Migrate(args) => command_migrate(&config, args),
         Command::Doctor => command_doctor(&config),
         Command::Scan(args) => {
             let mut ledger = open_scan_ledger(&config, args.dry_run)?;
@@ -707,10 +717,31 @@ fn command_is_machine(command: &Command) -> bool {
         Command::Export(_) => true,
         Command::Demo
         | Command::Init(_)
+        | Command::Migrate(_)
         | Command::Doctor
         | Command::Scan(_)
         | Command::Purge(_) => false,
     }
+}
+
+fn command_migrate(config: &Config, args: MigrateArgs) -> Result<()> {
+    if !args.accept_history_loss {
+        anyhow::bail!(
+            "migration not authorized. The v0.4.1 privacy migration permanently deletes cached \
+             observations, scan history, warnings, and reconciliation imports. If original Claude \
+             Code or Codex source files are missing, that accounting cannot be rebuilt. Retain the \
+             source files and export or back up the v0.4.1 ledger, then rerun with \
+             `--accept-history-loss`"
+        );
+    }
+    let ledger = Ledger::open_for_v6_privacy_migration(&config.resolved_database_path()?)?;
+    emit_success(
+        "MIGRATION COMPLETE",
+        &format!(
+            "Privacy barrier applied to {}. Run `token-ledger scan --rebuild` to rebuild accounting from retained source files, then re-import reconciliation exports.",
+            ledger.path().display()
+        ),
+    )
 }
 
 fn command_init(mut config: Config, path: &Path, args: InitArgs) -> Result<()> {

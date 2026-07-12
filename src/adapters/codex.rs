@@ -100,6 +100,11 @@ impl SourceAdapter for CodexAdapter {
             }
             Ok(Some(SourceSpec {
                 path: path.to_path_buf(),
+                trusted_root: roots
+                    .iter()
+                    .find(|root| path.starts_with(root))
+                    .cloned()
+                    .context("discovered Codex source escaped its trusted root")?,
                 client: Client::OpenaiCodex,
                 compressed,
             }))

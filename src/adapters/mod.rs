@@ -339,6 +339,7 @@ mod tests {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
             .then(|| SourceSpec {
                 path: path.to_path_buf(),
+                trusted_root: path.parent().unwrap_or(path).to_path_buf(),
                 client: Client::ClaudeCode,
                 compressed: false,
             }))

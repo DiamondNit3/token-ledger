@@ -143,7 +143,7 @@ fn scan_with_limits(
     } else {
         Some(ledger.start_scan(mode)?)
     };
-    let mut stable_sources = Vec::<(PathBuf, SourceFingerprint)>::new();
+    let mut stable_sources = Vec::<(PathBuf, PathBuf, SourceFingerprint)>::new();
     let mut active_or_volatile_sources = HashSet::<PathBuf>::new();
     let mut incomplete_sources = HashSet::<PathBuf>::new();
     let client_scope_limited = !options.clients.is_empty()
@@ -414,7 +414,11 @@ fn scan_with_limits(
                                 &mut remaining_warnings,
                             )?;
                         }
-                        stable_sources.push((source.path.clone(), fingerprint));
+                        stable_sources.push((
+                            source.path.clone(),
+                            source.trusted_root.clone(),
+                            fingerprint,
+                        ));
                     }
                     Ok(SourceOutcome::Scanned {
                         records,
@@ -460,7 +464,11 @@ fn scan_with_limits(
                                 &mut remaining_warnings,
                             )?;
                         }
-                        stable_sources.push((source.path.clone(), fingerprint));
+                        stable_sources.push((
+                            source.path.clone(),
+                            source.trusted_root.clone(),
+                            fingerprint,
+                        ));
                     }
                     Ok(SourceOutcome::Limited(warning)) => {
                         incomplete_sources.insert(source.path.clone());
@@ -523,13 +531,13 @@ fn scan_with_limits(
         // Capture the common boundary before revalidation so every source's
         // original and final fingerprints bracket the reported `as_of`.
         revalidation_boundary = Some(Utc::now());
-        for (index, (path, fingerprint)) in stable_sources.iter().enumerate() {
+        for (index, (path, trusted_root, fingerprint)) in stable_sources.iter().enumerate() {
             if index % 32 == 0
                 && let Some(run_id) = scan_run_id
             {
                 ledger.heartbeat_scan(run_id)?;
             }
-            if source_fingerprint(path).as_ref().ok() != Some(fingerprint) {
+            if source_fingerprint_within(path, trusted_root).as_ref().ok() != Some(fingerprint) {
                 active_or_volatile_sources.insert(path.clone());
             }
         }
@@ -761,7 +769,7 @@ fn rotating_window_start(seed: usize, window: usize, source_count: usize) -> usi
 /// parsing, and decompression. Reserving this before opening a source keeps one
 /// invocation's aggregate work finite even when discovery returns many files.
 fn estimate_source_work(source: &SourceSpec, limits: ScanLimits) -> Result<u64> {
-    let file = open_source_file(&source.path)?;
+    let file = open_source_file_within(&source.path, &source.trusted_root)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         anyhow::bail!("source is not a regular file");
@@ -836,6 +844,11 @@ impl SourceWorkReservation<'_> {
         self.reserved_bytes = opened_work;
         true
     }
+
+    fn admit_attempt(&mut self, opened_work: u64, attempt: usize) -> bool {
+        let cumulative = opened_work.saturating_mul((attempt as u64).saturating_add(1));
+        self.admit(cumulative)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -882,7 +895,7 @@ fn scan_one(
         // complete fingerprint, checkpoint validation, and parse. The work
         // reservation is revalidated from this handle so a pathname swap
         // cannot turn a small scheduled source into unmetered work.
-        let file = open_source_file(&source.path)?;
+        let file = open_source_file_within(&source.path, &source.trusted_root)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             anyhow::bail!("source is not a regular file");
@@ -894,16 +907,25 @@ fn scan_one(
             )));
         }
         let opened_work = estimate_source_work_for_size(metadata.len(), source.compressed, limits);
-        if !work_reservation.admit(opened_work) {
+        if !work_reservation.admit_attempt(opened_work, attempt) {
             return Ok(SourceOutcome::Limited(ScanWarning::new(
                 "scan_resource_limit",
-                "source changed after scheduling and exceeded the remaining aggregate work budget; it was not read",
+                "source changed or required another stability attempt that exceeded the remaining aggregate work budget; it was not read again",
             )));
         }
-        let before = source_fingerprint_from_file(&file)
-            .with_context(|| format!("failed to fingerprint {}", source.path.display()))?;
-        let prepared = prepare_source(ledger, adapter, source, options, &file, &before, limits);
-        let after = source_fingerprint(&source.path);
+        let (snapshot, before) =
+            match snapshot_source(&file, &metadata, limits.max_source_file_bytes) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    active_during_scan = true;
+                    if attempt + 1 == SOURCE_STABILITY_ATTEMPTS {
+                        return Ok(SourceOutcome::Volatile);
+                    }
+                    continue;
+                }
+            };
+        let prepared = prepare_source(ledger, adapter, source, options, &snapshot, &before, limits);
+        let after = source_fingerprint_within(&source.path, &source.trusted_root);
 
         let stable = after
             .as_ref()
@@ -1525,8 +1547,14 @@ fn hash_window_ending_at_file(file: &File, offset: u64) -> Result<String> {
 /// scheduler accounts for repeated full-file stability checks. Full digests
 /// prevent a same-size, timestamp-preserving rewrite outside sample windows
 /// from retaining stale accounting.
+#[cfg(test)]
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     let file = open_source_file(path)?;
+    source_fingerprint_from_file(&file)
+}
+
+fn source_fingerprint_within(path: &Path, trusted_root: &Path) -> Result<SourceFingerprint> {
+    let file = open_source_file_within(path, trusted_root)?;
     source_fingerprint_from_file(&file)
 }
 
@@ -1542,6 +1570,41 @@ fn source_fingerprint_from_file(file: &File) -> Result<SourceFingerprint> {
         sample_hash: hash_exact_prefix_file(file, file_size)?,
         exhaustive: true,
     })
+}
+
+/// Copies one admitted source into an unlinked private temporary file and
+/// fingerprints those exact bytes. Parsing the snapshot prevents concurrent
+/// same-inode edits from injecting bytes between the integrity check and the
+/// parser. The original handle is used only to capture and later validate the
+/// source; observations are never parsed from a live, mutable file.
+fn snapshot_source(
+    source: &File,
+    metadata_before: &Metadata,
+    max_source_file_bytes: u64,
+) -> Result<(File, SourceFingerprint)> {
+    if metadata_before.len() > max_source_file_bytes {
+        anyhow::bail!("source exceeded the bounded file-size limit");
+    }
+    let mut input = source.try_clone()?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut snapshot = tempfile::tempfile().context("failed to create private source snapshot")?;
+    let copied = io::copy(
+        &mut input.take(max_source_file_bytes.saturating_add(1)),
+        &mut snapshot,
+    )?;
+    if copied != metadata_before.len() || copied > max_source_file_bytes {
+        anyhow::bail!("source changed size while its bounded snapshot was captured");
+    }
+    let metadata_after = source.metadata()?;
+    if metadata_after.len() != metadata_before.len()
+        || modified_ns(&metadata_after) != modified_ns(metadata_before)
+    {
+        anyhow::bail!("source changed while its bounded snapshot was captured");
+    }
+    snapshot.seek(SeekFrom::Start(0))?;
+    let mut fingerprint = source_fingerprint_from_file(&snapshot)?;
+    fingerprint.modified_ns = modified_ns(metadata_before);
+    Ok((snapshot, fingerprint))
 }
 
 fn hash_exact_prefix_file(file: &File, length: u64) -> Result<String> {
@@ -1596,6 +1659,56 @@ fn open_source_file(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+fn open_source_file_within(path: &Path, trusted_root: &Path) -> io::Result<File> {
+    validate_no_link_ancestors(path, trusted_root)?;
+    let file = open_source_file(path)?;
+    validate_no_link_ancestors(path, trusted_root)?;
+    Ok(file)
+}
+
+/// Rejects symbolic-link and Windows reparse-point ancestors. The final
+/// component is also protected by the no-follow open above. This is a
+/// defense-in-depth pathname check; Token Ledger is not a sandbox for source
+/// trees controlled by a concurrent hostile process.
+fn validate_no_link_ancestors(path: &Path, trusted_root: &Path) -> io::Result<()> {
+    if !path.starts_with(trusted_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source escaped its trusted discovery root",
+        ));
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor == trusted_root {
+            return Ok(());
+        }
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source has a symbolic-link ancestor",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source has a reparse-point ancestor",
+                ));
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "source did not descend from its trusted discovery root",
+    ))
 }
 
 fn hash_file_range(file: &mut File, start: u64, length: u64, hasher: &mut Sha256) -> Result<()> {
@@ -1675,6 +1788,114 @@ mod tests {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn create_test_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory symlinks are unsupported on this platform",
+            ))
+        }
+    }
+
+    #[test]
+    fn source_with_linked_ancestor_is_rejected() -> Result<()> {
+        let directory = tempdir()?;
+        let real_parent = directory.path().join("real");
+        std::fs::create_dir(&real_parent)?;
+        std::fs::write(real_parent.join("source.jsonl"), b"{}\n")?;
+        let linked_parent = directory.path().join("linked");
+        match create_test_dir_symlink(&real_parent, &linked_parent) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                ) || error.raw_os_error() == Some(1314) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let error = open_source_file_within(&linked_parent.join("source.jsonl"), directory.path())
+            .expect_err("linked ancestor must be rejected");
+        assert!(error.to_string().contains("ancestor"));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_root_may_be_an_operating_system_alias() -> Result<()> {
+        let directory = tempdir()?;
+        let real_root = directory.path().join("private-root");
+        std::fs::create_dir(&real_root)?;
+        std::fs::write(real_root.join("source.jsonl"), b"{}\n")?;
+        let trusted_alias = directory.path().join("system-alias");
+        match create_test_dir_symlink(&real_root, &trusted_alias) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                ) || error.raw_os_error() == Some(1314) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let file = open_source_file_within(&trusted_alias.join("source.jsonl"), &trusted_alias)?;
+        assert_eq!(file.metadata()?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_snapshot_digest_matches_the_bytes_that_are_parsed() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("source.jsonl");
+        std::fs::write(&path, b"original\n")?;
+        let source = open_source_file(&path)?;
+        let metadata = source.metadata()?;
+        let original_mtime = metadata.modified()?;
+        let (snapshot, snapshot_fingerprint) =
+            snapshot_source(&source, &metadata, MAX_SOURCE_FILE_BYTES)?;
+
+        std::fs::write(&path, b"injected\n")?;
+        let rewritten = OpenOptions::new().write(true).open(&path)?;
+        rewritten.set_times(FileTimes::new().set_modified(original_mtime))?;
+
+        assert_eq!(
+            snapshot_fingerprint.sample_hash,
+            source_fingerprint_from_file(&snapshot)?.sample_hash
+        );
+        assert_ne!(
+            snapshot_fingerprint.sample_hash,
+            source_fingerprint(&path)?.sample_hash
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stability_retries_consume_additional_aggregate_work() {
+        let mut remaining = 10;
+        let mut reservation = SourceWorkReservation {
+            reserved_bytes: 10,
+            remaining_bytes: &mut remaining,
+        };
+        assert!(reservation.admit_attempt(10, 0));
+        assert!(reservation.admit_attempt(10, 1));
+        assert!(!reservation.admit_attempt(10, 2));
+        assert_eq!(remaining, 0);
     }
 
     fn claude_record(id: &str, output_tokens: u64) -> String {
@@ -1767,6 +1988,7 @@ mod tests {
         Box::new(ClientStaticAdapter {
             client,
             sources: vec![SourceSpec {
+                trusted_root: path.parent().expect("test source parent").to_path_buf(),
                 path,
                 client,
                 compressed: false,
@@ -1777,6 +1999,7 @@ mod tests {
     fn static_adapters(path: PathBuf, compressed: bool) -> Vec<Box<dyn SourceAdapter>> {
         vec![Box::new(StaticAdapter {
             sources: vec![SourceSpec {
+                trusted_root: path.parent().expect("test source parent").to_path_buf(),
                 path,
                 client: Client::ClaudeCode,
                 compressed,
@@ -1805,6 +2028,11 @@ mod tests {
         ) -> Result<DiscoveryResult> {
             Ok(DiscoveryResult::complete(vec![SourceSpec {
                 path: self.source.clone(),
+                trusted_root: self
+                    .source
+                    .parent()
+                    .expect("test source parent")
+                    .to_path_buf(),
                 client: Client::ClaudeCode,
                 compressed: false,
             }]))
@@ -1852,6 +2080,7 @@ mod tests {
                     .iter()
                     .map(|path| SourceSpec {
                         path: path.clone(),
+                        trusted_root: path.parent().expect("test source parent").to_path_buf(),
                         client: Client::ClaudeCode,
                         compressed: false,
                     })
@@ -2297,6 +2526,7 @@ mod tests {
         std::fs::write(&source_path, claude_record("small", 1))?;
         let source = SourceSpec {
             path: source_path.clone(),
+            trusted_root: dir.path().to_path_buf(),
             client: Client::ClaudeCode,
             compressed: false,
         };
@@ -2355,6 +2585,7 @@ mod tests {
             sources: vec![first.clone(), second]
                 .into_iter()
                 .map(|path| SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::ClaudeCode,
                     compressed: false,
@@ -2528,6 +2759,7 @@ mod tests {
                 let path = dir.path().join(format!("{index}.jsonl"));
                 std::fs::write(&path, claude_record(&format!("message-{index}"), 1))?;
                 Ok(SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::ClaudeCode,
                     compressed: false,
@@ -2582,6 +2814,7 @@ mod tests {
                 let path = dir.path().join(format!("work-{index}.jsonl"));
                 std::fs::write(&path, claude_record(&format!("message-{index}"), 1))?;
                 Ok(SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::ClaudeCode,
                     compressed: false,
@@ -2620,6 +2853,7 @@ mod tests {
                 let path = dir.path().join(format!("count-{index}.jsonl"));
                 std::fs::write(&path, claude_record(&format!("message-{index}"), 1))?;
                 Ok(SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::ClaudeCode,
                     compressed: false,
@@ -2660,6 +2894,7 @@ mod tests {
                 let path = dir.path().join(format!("warning-{index}.jsonl"));
                 std::fs::write(&path, "not-json\n")?;
                 Ok(SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::ClaudeCode,
                     compressed: false,
@@ -2715,6 +2950,7 @@ mod tests {
         limits.max_total_work_bytes = estimate_source_work(
             &SourceSpec {
                 path: claude,
+                trusted_root: dir.path().to_path_buf(),
                 client: Client::ClaudeCode,
                 compressed: false,
             },
@@ -2750,6 +2986,7 @@ mod tests {
                 let path = dir.path().join(format!("claude-window-{index:02}.jsonl"));
                 std::fs::write(&path, "{}\n")?;
                 Ok(SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::ClaudeCode,
                     compressed: false,
@@ -2761,6 +2998,7 @@ mod tests {
                 let path = dir.path().join(format!("codex-window-{index:02}.jsonl"));
                 std::fs::write(&path, "{}\n")?;
                 Ok(SourceSpec {
+                    trusted_root: path.parent().expect("test source parent").to_path_buf(),
                     path,
                     client: Client::OpenaiCodex,
                     compressed: false,
@@ -2951,6 +3189,7 @@ mod tests {
         std::fs::write(&target, claude_record("must-not-import", 99))?;
         let source = SourceSpec {
             path: source_path.clone(),
+            trusted_root: dir.path().to_path_buf(),
             client: Client::ClaudeCode,
             compressed: false,
         };
