@@ -17,7 +17,7 @@ No changes yet.
 ### Scanner hardening
 
 - Parse each admitted source from a bounded private snapshot whose exact digest is compared with the post-parse live source, closing the hash-before-parse mutation gap.
-- Reject detected symbolic-link and Windows reparse-point ancestors in addition to the final source component, while documenting that the CLI is not a sandbox for hostile concurrently controlled source trees.
+- Carry each trusted discovery boundary through scanning and reject detected symbolic-link and Windows reparse-point ancestors below it, while preserving trusted operating-system aliases such as macOS `/var` and documenting that the CLI is not a sandbox for hostile concurrently controlled source trees.
 - Charge every stability retry against the 2 GiB aggregate work budget instead of reusing the first attempt's reservation.
 
 ## 0.4.2 - 2026-07-12

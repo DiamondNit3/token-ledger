@@ -124,7 +124,7 @@ impl SourceAdapter for ClaudeAdapter {
             )
         })?;
 
-        discover_bounded_files(&[projects_root], request, |path| {
+        discover_bounded_files(std::slice::from_ref(&projects_root), request, |path| {
             if !path
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -134,6 +134,7 @@ impl SourceAdapter for ClaudeAdapter {
             }
             Ok(Some(SourceSpec {
                 path: path.to_path_buf(),
+                trusted_root: projects_root.clone(),
                 client: Client::ClaudeCode,
                 compressed: false,
             }))

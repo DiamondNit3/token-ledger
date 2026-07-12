@@ -384,6 +384,10 @@ pub struct EventProvenance {
 #[derive(Debug, Clone)]
 pub struct SourceSpec {
     pub path: PathBuf,
+    /// Lexical discovery boundary. Ancestor link/reparse checks apply below
+    /// this root, while trusted operating-system aliases above it are outside
+    /// the scanner's source-tree threat boundary.
+    pub trusted_root: PathBuf,
     pub client: Client,
     pub compressed: bool,
 }

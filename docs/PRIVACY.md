@@ -62,7 +62,7 @@ Purge cannot erase external backups, filesystem snapshots, crash dumps, exported
 
 Token Ledger does not protect data from an attacker who already has equivalent access to the user's account or filesystem. It does not encrypt its database. Local filesystem permissions, device encryption, backup policy, and operating-system security remain the user's responsibility.
 
-The scanner rejects detected symbolic-link and Windows reparse-point source components, parses a bounded private snapshot, and verifies the live source before commit. It is not a sandbox for session roots that a hostile process can concurrently replace or manipulate. Configure only roots controlled by the same trusted account.
+The scanner rejects detected symbolic-link and Windows reparse-point source components below each trusted discovery root, parses a bounded private snapshot, and verifies the live source before commit. Trusted operating-system path aliases above the discovery boundary remain compatible. It is not a sandbox for session roots that a hostile process can concurrently replace or manipulate. Configure only roots controlled by the same trusted account.
 
 Model names, timestamps, token totals, price dimensions, and billing evidence can reveal work patterns even without transcript content.
 
