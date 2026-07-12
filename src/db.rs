@@ -293,6 +293,20 @@ impl Ledger {
             .optional()?;
         match existing {
             None => {
+                // A missing schema marker is only evidence of a new database
+                // when no ledger state exists. Treating an already-populated
+                // database as fresh would stamp the privacy barriers complete
+                // without proving that stored identifiers had ever been
+                // scrubbed. Fail closed and leave recovery/destruction to an
+                // explicit user action outside the ordinary open path.
+                if database_has_existing_state(&transaction)? {
+                    anyhow::bail!(
+                        "database schema metadata is missing but existing ledger data or privacy \
+                         metadata was found. Refusing to mark this database privacy-safe. Restore \
+                         the database (including its WAL state) from a known-good backup, or move \
+                         this database aside and deliberately create and rebuild a new ledger"
+                    );
+                }
                 ensure_v6_storage_columns(&transaction)?;
                 transaction.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -1481,6 +1495,31 @@ impl Ledger {
         )?;
         Ok(())
     }
+}
+
+/// Returns true when a database without `schema_version` cannot be proven
+/// fresh. Every table in this query is created before migration starts, so the
+/// check is safe for both a brand-new file and a partially damaged ledger.
+fn database_has_existing_state(transaction: &Transaction<'_>) -> Result<bool> {
+    const STATE_TABLES: &[&str] = &[
+        "source_files",
+        "usage_observations",
+        "codex_event_identity_aliases",
+        "codex_event_identity_replays",
+        "scan_runs",
+        "scan_warnings",
+        "reconciliation_imports",
+        "reconciliation_buckets",
+        "meta",
+    ];
+
+    for table in STATE_TABLES {
+        let query = format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)");
+        if transaction.query_row(&query, [], |row| row.get::<_, bool>(0))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn advance_schema_version(transaction: &Transaction<'_>, expected: i64, next: i64) -> Result<()> {
@@ -4282,6 +4321,69 @@ mod tests {
             |row| row.get(0),
         )?;
         assert!(!stored.contains(RAW_AFTER));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_schema_metadata_with_existing_state_fails_closed() -> Result<()> {
+        const RAW_PATH: &str = "C:\\Users\\alice\\.claude\\projects\\private-session.jsonl";
+
+        let directory = tempdir()?;
+        let database = directory.path().join("missing-metadata.sqlite");
+        {
+            let ledger = Ledger::open(&database)?;
+            ledger.connection.execute(
+                "INSERT INTO source_files(client, path, privacy_write_generation) \
+                 VALUES ('claude_code', ?1, 1)",
+                [RAW_PATH],
+            )?;
+            ledger.connection.execute_batch(
+                "DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_replace;
+                 DELETE FROM meta;",
+            )?;
+        }
+
+        let error = Ledger::open(&database)
+            .err()
+            .context("ordinary open must reject populated databases with missing metadata")?;
+        assert!(error.to_string().contains("schema metadata is missing"));
+        assert!(error.to_string().contains("Refusing to mark"));
+
+        let error = Ledger::open_for_v6_privacy_migration(&database)
+            .err()
+            .context("v6 migration consent must not bless an unknown schema generation")?;
+        assert!(error.to_string().contains("schema metadata is missing"));
+
+        let connection = Connection::open(&database)?;
+        let stored: String =
+            connection.query_row("SELECT path FROM source_files LIMIT 1", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(stored, RAW_PATH, "failed opens must preserve the evidence");
+        let metadata_rows: i64 =
+            connection.query_row("SELECT COUNT(*) FROM meta", [], |row| row.get(0))?;
+        assert_eq!(metadata_rows, 0, "failed opens must not stamp new metadata");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_schema_metadata_is_initialized_only_when_database_is_empty() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("fresh.sqlite");
+        std::fs::File::create(&database)?;
+
+        let ledger = Ledger::open(&database)?;
+        let (version, state_rows): (i64, i64) = ledger.connection.query_row(
+            "SELECT
+                 (SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'),
+                 (SELECT COUNT(*) FROM source_files)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(state_rows, 0);
         Ok(())
     }
 

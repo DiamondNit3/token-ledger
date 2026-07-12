@@ -6,7 +6,7 @@ See how many tokens Claude Code and OpenAI Codex used each day—and estimate th
 
 - **Local-first.** Session files stay on your machine; prompts, responses, credentials, and raw provider identifiers are not copied into the ledger.
 - **Honest estimates.** Partial coverage, unknown prices, credits, and recorded cash remain separate instead of turning missing evidence into zero.
-- **Auditable results.** Effective-dated pricing, exact source digests, stable exports, and checksummed native releases make results reproducible.
+- **Auditable results.** Effective-dated pricing, exact source digests, stable schemas, and checksummed native releases make accounting decisions reproducible.
 
 > Token Ledger is an unofficial community project and is not affiliated with OpenAI or Anthropic.
 
@@ -60,7 +60,11 @@ Run `token-ledger --help` or `token-ledger <COMMAND> --help` for the complete CL
 ## Upgrading from v0.4.1
 
 > [!CAUTION]
-> Retain the original Claude Code and Codex session files and export or back up the v0.4.1 ledger before migrating. History cannot be rebuilt when its original source files have expired or been deleted.
+> Retain the original Claude Code and Codex session files and back up the v0.4.1 ledger before migrating. History cannot be rebuilt when its original source files have expired or been deleted.
+
+Do this **before opening the database with the newer binary**. A newer release blocks all database commands until migration is authorized, including `export`. If you want a report export, create it with the old v0.4.1 executable. Report exports are archival views and cannot restore the local ledger.
+
+For a restorable backup, stop every Token Ledger process and use SQLite's backup API (for example, `sqlite3 old.sqlite ".backup backup.sqlite"`). A raw file copy is safe only when the database is quiescent and the database, `-wal`, and `-shm` files are captured consistently together.
 
 After backing up:
 
@@ -76,6 +80,8 @@ Then re-import any reconciliation exports. Ordinary database commands fail close
 Token Ledger reports provider-recorded token counters and calculates what matching usage would cost under the bundled public price catalog. That estimate is not an invoice: subscriptions, prepaid credits, taxes, discounts, and negotiated pricing may differ.
 
 Unknown prices are never treated as `$0`. Reports distinguish exact, bounded, partial, and unpriced results, include catalog evidence, and mark incomplete scans as provisional. Provider reconciliation imports and user-recorded cash never overwrite locally observed usage.
+
+The accounting rules and price evidence are reproducible; complete export bytes are not guaranteed to be byte-identical because reports include current scan and generation timestamps.
 
 ## Privacy and coverage
 

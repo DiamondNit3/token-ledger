@@ -33,6 +33,8 @@ cargo fetch --locked
 
 CI and the release workflow compile the pinned generator and reproduce the notice byte-for-byte; `.gitattributes` and the generator pin notice/template line endings to LF for clean-checkout stability. Review newly selected licenses and text whenever `Cargo.lock`, the target matrix, `about.toml`, `about.hbs`, or the generator version changes. A distributor remains responsible for satisfying the selected license terms.
 
+The bundled SQLite runtime is security-sensitive because Token Ledger uses WAL mode across processes. A runtime integration test queries `sqlite_version()` and rejects versions affected by SQLite's WAL-reset advisory; dependency updates must also pass the Rust 1.88 minimum-version job.
+
 ## Minimum Rust version
 
 Rust 1.86 was rejected by a locked transitive build path in `comfy-table`. The complete suite passes on Rust 1.88, which is therefore the declared minimum supported Rust version for this source release.

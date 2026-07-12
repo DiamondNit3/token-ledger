@@ -6,6 +6,22 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 No changes yet.
 
+## 0.4.4 - 2026-07-12
+
+### Security
+
+- Upgraded `rusqlite` to 0.39.0 and bundled `libsqlite3-sys` to 0.37.0, moving the shipped SQLite runtime from vulnerable 3.50.2 to fixed 3.51.3.
+- Made a missing `schema_version` fail closed whenever any ledger or privacy state exists; neither ordinary open nor migration consent can bless damaged metadata as a fresh database.
+
+### Fixed
+
+- Added a runtime regression that rejects bundled SQLite versions affected by the WAL-reset advisory.
+- Added database regressions for damaged metadata with a retained raw path and for genuinely empty database initialization.
+- Added end-to-end migration CLI tests covering missing consent, `--db` targeting, authorized migration, idempotency, fresh databases, and WAL cleanup failure.
+- Added help text for destructive confirmations, `--no-scan`, grouping, format, and export destination options.
+- Clarified that v0.4.1 report exports must be created with the old binary, cannot restore the ledger, and are distinct from a SQLite-safe backup that captures WAL state.
+- Narrowed the reproducibility claim to accounting decisions and price evidence; complete export bytes include current scan and generation timestamps.
+
 ## 0.4.3 - 2026-07-12
 
 ### Launch safety
