@@ -19,7 +19,6 @@ use crate::model::{
 const LINE_BATCH_SIZE: usize = 512;
 const LINE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const CHECKPOINT_WINDOW: u64 = 4096;
-const FINGERPRINT_WINDOW: u64 = 4096;
 const EXACT_FINGERPRINT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SOURCES_PER_ADAPTER_SCAN: usize = 4_096;
 const SOURCE_STABILITY_ATTEMPTS: usize = 3;
@@ -774,10 +773,11 @@ fn estimate_source_work(source: &SourceSpec, limits: ScanLimits) -> Result<u64> 
             .saturating_add(1024 * 1024)
     } else {
         let compressed_input = if source.compressed { file_size } else { 0 };
-        parse_bytes
-            .saturating_mul(3)
+        file_size
+            .saturating_mul(8)
+            .saturating_add(parse_bytes.saturating_mul(3))
             .saturating_add(compressed_input.saturating_mul(3))
-            .saturating_add(64 * 1024 * 1024)
+            .saturating_add(1024 * 1024)
     };
     Ok(estimate.max(1))
 }
@@ -811,6 +811,7 @@ struct SourceFingerprint {
 
 enum PreparedSource {
     Unchanged,
+    Limited(ScanWarning),
     Scanned(Box<PreparedSourceUpdate>),
 }
 
@@ -825,6 +826,7 @@ struct PreparedSourceUpdate {
     checkpoint_hash: String,
     head_hash: String,
     persisted_state: Value,
+    content_hash: String,
     batch: ParseBatch,
 }
 
@@ -876,6 +878,7 @@ fn scan_one(
                 fingerprint,
                 active_during_scan,
             }),
+            PreparedSource::Limited(warning) => Ok(SourceOutcome::Limited(warning)),
             PreparedSource::Scanned(prepared) => {
                 let observation_count = prepared.batch.observations.len() as u64;
                 let warning_count = prepared.batch.warnings.len() as u64;
@@ -906,6 +909,7 @@ fn scan_one(
                         warnings: &prepared.batch.warnings,
                         scan_run_id: run_id,
                     })?;
+                    ledger.update_source_content_hash(source_id, &prepared.content_hash)?;
                 }
                 Ok(SourceOutcome::Scanned {
                     records: prepared.records,
@@ -935,8 +939,34 @@ fn prepare_source(
     let modified_ns = fingerprint.modified_ns;
     let existing = ledger.source_checkpoint(&source.path)?;
 
+    if source.compressed
+        && !options.full
+        && existing.as_ref().is_some_and(|checkpoint| {
+            checkpoint.file_size == file_size
+                && checkpoint.modified_ns == modified_ns
+                && checkpoint
+                    .adapter_state
+                    .get("compressed_archive_unsupported")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .adapter_state
+                    .get("compressed_source_hash")
+                    .and_then(Value::as_str)
+                    == Some(fingerprint.sample_hash.as_str())
+        })
+    {
+        return Ok(PreparedSource::Limited(compressed_archive_limit_warning()));
+    }
+
     if !options.full
-        && is_unchanged(source, existing.as_ref(), file_size, modified_ns)
+        && is_unchanged(
+            source,
+            existing.as_ref(),
+            file_size,
+            modified_ns,
+            &fingerprint.sample_hash,
+        )
         && checkpoint_still_valid(
             &source.path,
             existing
@@ -957,6 +987,8 @@ fn prepare_source(
         if checkpoint.client != source.client
             || checkpoint.compressed != source.compressed
             || checkpoint.checkpoint_offset > file_size
+            || (file_size <= checkpoint.file_size
+                && checkpoint.content_hash != fingerprint.sample_hash)
             || requires_backfill(checkpoint, file_size)
             || (file_size <= checkpoint.file_size && modified_ns != checkpoint.modified_ns)
             || !checkpoint_still_valid(&source.path, checkpoint)?
@@ -993,6 +1025,42 @@ fn prepare_source(
     };
     if source.compressed {
         state = parsed.next_state.clone();
+        if !parsed.complete
+            && parsed
+                .batch
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "source_resource_limit")
+        {
+            // Compressed streams are not seekable using the durable source
+            // checkpoint. Never replace accounting with a prefix that cannot
+            // advance on a later scan. Persist only a content-bound hard-stop
+            // marker so unchanged archives fail quickly and deterministically.
+            state = serde_json::json!({
+                "compressed_archive_unsupported": true,
+                "compressed_source_hash": fingerprint.sample_hash,
+            });
+            let warning = compressed_archive_limit_warning();
+            return Ok(PreparedSource::Scanned(Box::new(PreparedSourceUpdate {
+                reset: true,
+                complete: false,
+                records: parsed.records,
+                file_size,
+                modified_ns,
+                checkpoint_offset: 0,
+                checkpoint_line: 0,
+                checkpoint_hash: hash_window_ending_at(&source.path, 0)?,
+                head_hash: hash_head(&source.path, 0)?,
+                persisted_state: state,
+                content_hash: fingerprint.sample_hash.clone(),
+                batch: ParseBatch {
+                    observations: Vec::new(),
+                    warnings: vec![warning],
+                    next_state: Value::Null,
+                    incomplete: true,
+                },
+            })));
+        }
     }
 
     let parsed_checkpoint_offset = if source.compressed {
@@ -1032,6 +1100,7 @@ fn prepare_source(
         checkpoint_hash,
         head_hash,
         persisted_state,
+        content_hash: fingerprint.sample_hash.clone(),
         batch: parsed.batch,
     })))
 }
@@ -1335,17 +1404,26 @@ fn resource_limit_warning(offset: u64, line_number: u64) -> ScanWarning {
     .at(format!("line {} @ byte {offset}", line_number + 1))
 }
 
+fn compressed_archive_limit_warning() -> ScanWarning {
+    ScanWarning::new(
+        "compressed_archive_unsupported",
+        "compressed source exceeds the supported decompressed-size or record limit; no partial usage was imported",
+    )
+}
+
 fn is_unchanged(
     source: &SourceSpec,
     existing: Option<&SourceCheckpoint>,
     file_size: u64,
     modified_ns: i64,
+    content_hash: &str,
 ) -> bool {
     existing.is_some_and(|checkpoint| {
         checkpoint.client == source.client
             && checkpoint.compressed == source.compressed
             && checkpoint.file_size == file_size
             && checkpoint.modified_ns == modified_ns
+            && checkpoint.content_hash == content_hash
             && !checkpoint_is_partial(checkpoint)
     })
 }
@@ -1366,7 +1444,7 @@ fn checkpoint_still_valid(path: &Path, checkpoint: &SourceCheckpoint) -> Result<
 }
 
 fn hash_head(path: &Path, checkpoint_offset: u64) -> Result<String> {
-    hash_prefix_signature(path, checkpoint_offset)
+    hash_exact_prefix(path, checkpoint_offset)
 }
 
 fn hash_window_ending_at(path: &Path, offset: u64) -> Result<String> {
@@ -1378,9 +1456,11 @@ fn hash_window_ending_at(path: &Path, offset: u64) -> Result<String> {
     Ok(hex::encode(Sha256::digest(&buffer)))
 }
 
-/// Exact fingerprints are used for ordinary source sizes. Larger sources use
-/// evenly distributed bounded samples; callers must keep those snapshots
-/// provisional because sampled equality is not proof of content equality.
+/// Hash the complete physical source. The caller applies a strict physical
+/// file-size ceiling before reaching this function, and the aggregate work
+/// scheduler accounts for repeated full-file stability checks. Full digests
+/// prevent a same-size, timestamp-preserving rewrite outside sample windows
+/// from retaining stale accounting.
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
@@ -1390,30 +1470,17 @@ fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     Ok(SourceFingerprint {
         file_size,
         modified_ns: modified_ns(&metadata),
-        sample_hash: hash_prefix_signature(path, file_size)?,
-        exhaustive: file_size <= EXACT_FINGERPRINT_BYTES,
+        sample_hash: hash_exact_prefix(path, file_size)?,
+        exhaustive: true,
     })
 }
 
-fn hash_prefix_signature(path: &Path, length: u64) -> Result<String> {
-    const SAMPLE_COUNT: u64 = 16;
-
+fn hash_exact_prefix(path: &Path, length: u64) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"token-ledger-prefix-v2");
+    hasher.update(b"token-ledger-source-v3");
     hasher.update(length.to_le_bytes());
-
-    if length <= EXACT_FINGERPRINT_BYTES {
-        hash_file_range(&mut file, 0, length, &mut hasher)?;
-    } else {
-        let sample_len = length.min(FINGERPRINT_WINDOW);
-        let last_start = length.saturating_sub(sample_len);
-        for index in 0..SAMPLE_COUNT {
-            let start = last_start.saturating_mul(index) / (SAMPLE_COUNT - 1);
-            hasher.update(start.to_le_bytes());
-            hash_file_range(&mut file, start, sample_len, &mut hasher)?;
-        }
-    }
+    hash_file_range(&mut file, 0, length, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -2000,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn decompressed_byte_limit_commits_only_a_provisional_prefix() -> Result<()> {
+    fn decompressed_byte_limit_hard_stops_without_importing_a_prefix() -> Result<()> {
         let dir = tempdir()?;
         let source = dir.path().join("archive.jsonl.zst");
         let first_record = claude_record("first", 1);
@@ -2023,21 +2090,40 @@ mod tests {
             limits,
         )?;
         assert_eq!(summary.scanned_sources, 1);
-        assert_eq!(summary.observations, 1);
+        assert_eq!(summary.observations, 0);
         assert!(summary.provisional);
         assert_eq!(summary.active_or_volatile_source_count, 0);
         assert_eq!(summary.incomplete_source_count, 1);
-        assert_eq!(ledger.canonical_events(None, None)?.len(), 1);
+        assert!(ledger.canonical_events(None, None)?.is_empty());
         let checkpoint = ledger
             .source_checkpoint(&source)?
             .context("compressed checkpoint missing")?;
         assert_eq!(checkpoint.checkpoint_offset, 0);
+        assert_eq!(
+            checkpoint
+                .adapter_state
+                .get("compressed_archive_unsupported")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(
             ledger
                 .warning_code_counts()?
                 .iter()
-                .any(|warning| warning.code == "source_resource_limit")
+                .any(|warning| warning.code == "compressed_archive_unsupported")
         );
+
+        let repeated = scan_with_limits(
+            &mut ledger,
+            &Config::default(),
+            &adapters,
+            &ScanOptions::default(),
+            limits,
+        )?;
+        assert_eq!(repeated.scanned_sources, 0);
+        assert_eq!(repeated.observations, 0);
+        assert!(repeated.provisional);
+        assert!(ledger.canonical_events(None, None)?.is_empty());
         Ok(())
     }
 
@@ -2700,37 +2786,67 @@ mod tests {
     }
 
     #[test]
-    fn sampled_large_source_verification_never_claims_complete_coverage() -> Result<()> {
+    fn full_digest_invalidates_large_same_size_mtime_preserving_rewrite() -> Result<()> {
         let dir = tempdir()?;
         let source = dir.path().join("large.jsonl");
-        let line = serde_json::json!({
+        let padding_line = serde_json::json!({
             "type": "user",
             "padding": "x".repeat(4096)
         })
         .to_string()
             + "\n";
-        let line_count = (EXACT_FINGERPRINT_BYTES as usize / line.len()) + 2;
-        let payload = line.repeat(line_count);
+        // Keep the usage record well away from the former 4 KiB sample at the
+        // head and from the next evenly-distributed sample window.
+        let prefix = padding_line.repeat(32);
+        let old_record = claude_record("large-rewrite", 1);
+        let new_record = claude_record("large-rewrite", 9);
+        assert_eq!(old_record.len(), new_record.len());
+        let minimum_suffix = EXACT_FINGERPRINT_BYTES as usize + 1 - prefix.len() - old_record.len();
+        let suffix = padding_line.repeat(minimum_suffix.div_ceil(padding_line.len()));
+        let payload = format!("{prefix}{old_record}{suffix}");
         assert!(payload.len() as u64 > EXACT_FINGERPRINT_BYTES);
-        std::fs::write(&source, payload)?;
-        let adapters = static_adapters(source, false);
+        std::fs::write(&source, &payload)?;
+        let adapters = static_adapters(source.clone(), false);
         let mut ledger = Ledger::open(&dir.path().join("ledger.sqlite"))?;
 
-        let summary = scan(
+        let initial = scan(
             &mut ledger,
             &Config::default(),
             &adapters,
             &ScanOptions::default(),
         )?;
-        assert_eq!(summary.scanned_sources, 1);
-        assert_eq!(summary.active_or_volatile_source_count, 0);
-        assert_eq!(summary.incomplete_source_count, 1);
-        assert!(summary.provisional);
-        assert!(
-            ledger
-                .warning_code_counts()?
-                .iter()
-                .any(|warning| warning.code == "source_verification_sampled")
+        assert_eq!(initial.scanned_sources, 1);
+        assert!(!initial.provisional);
+        assert_eq!(
+            ledger.canonical_events(None, None)?[0]
+                .usage
+                .output_tokens_total,
+            1
+        );
+
+        let original_modified = std::fs::metadata(&source)?.modified()?;
+        let rewritten = payload.replacen(&old_record, &new_record, 1);
+        assert_eq!(payload.len(), rewritten.len());
+        std::fs::write(&source, rewritten)?;
+        File::options()
+            .write(true)
+            .open(&source)?
+            .set_modified(original_modified)?;
+
+        let rescanned = scan(
+            &mut ledger,
+            &Config::default(),
+            &adapters,
+            &ScanOptions::default(),
+        )?;
+        assert_eq!(rescanned.scanned_sources, 1);
+        assert_eq!(rescanned.reset_sources, 1);
+        assert!(!rescanned.provisional);
+        assert_eq!(
+            ledger.canonical_events(None, None)?[0]
+                .usage
+                .output_tokens_total,
+            9
         );
         Ok(())
     }

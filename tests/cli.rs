@@ -682,6 +682,9 @@ fn migrated_codex_fork_identity_survives_single_source_rebuild() {
     {
         let connection = Connection::open(&fixture.database).expect("open pre-migration ledger");
         connection
+            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
+            .expect("mark ledger schema v4");
+        connection
             .execute(
                 r#"UPDATE usage_observations
                    SET event_key=?1, session_id=?2
@@ -696,9 +699,6 @@ fn migrated_codex_fork_identity_survives_single_source_rebuild() {
                 [legacy_state.to_string()],
             )
             .expect("restore v4 Codex parser state");
-        connection
-            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
-            .expect("mark ledger schema v4");
     }
     fs::remove_file(&child).expect("remove copied source before source-local rebuild");
 
@@ -822,6 +822,9 @@ fn shifted_codex_copy_after_migration_is_provisional_without_duplicate_usage() {
     {
         let connection = Connection::open(&fixture.database).expect("open v4 source ledger");
         connection
+            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
+            .expect("mark v4 ledger");
+        connection
             .execute(
                 r#"UPDATE usage_observations SET event_key=?1, session_id=?2
                    WHERE client='openai_codex'"#,
@@ -835,9 +838,6 @@ fn shifted_codex_copy_after_migration_is_provisional_without_duplicate_usage() {
                 [legacy_state.to_string()],
             )
             .expect("restore legacy state");
-        connection
-            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
-            .expect("mark v4 ledger");
     }
     fixture.run(&["scan", "--client", "codex", "--rebuild"]);
 

@@ -1,4 +1,6 @@
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -185,11 +187,10 @@ impl Config {
         self.validate_pricing_dimension_overrides()?;
         self.validate_billing_evidence()?;
         if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+            create_private_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+        write_private_file(path, text.as_bytes())
     }
 
     pub fn resolved_database_path(&self) -> Result<PathBuf> {
@@ -233,6 +234,42 @@ impl Config {
             .validate()
             .context("invalid billing evidence configuration")
     }
+}
+
+/// Creates an application directory and removes group/world access on Unix.
+pub(crate) fn create_private_dir_all(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Writes a sensitive application file as owner-readable/writable only on Unix.
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", path.display()))?;
+    }
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 fn iana_time_zone() -> Option<String> {
@@ -296,5 +333,25 @@ mod tests {
             ..Config::default()
         };
         assert!(config.validate_pricing_dimension_overrides().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_hardens_existing_directory_and_file_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let app_dir = directory.path().join("token-ledger");
+        fs::create_dir(&app_dir)?;
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o777))?;
+        let path = app_dir.join("config.toml");
+        fs::write(&path, "old")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+
+        Config::default().save(&path)?;
+
+        assert_eq!(fs::metadata(&app_dir)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
     }
 }

@@ -252,6 +252,7 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
 
@@ -270,6 +271,17 @@ jobs:
           object_type=$(git cat-file -t "$tag_ref")
           if [[ "$object_type" != 'tag' ]]; then
             echo "::error::Release tag ${GITHUB_REF_NAME} is lightweight; create an annotated or signed tag." >&2
+            exit 1
+          fi
+
+      - name: Require the tagged commit to be on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          tagged_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not point to a commit reachable from main." >&2
             exit 1
           fi
 
