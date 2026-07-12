@@ -1,16 +1,16 @@
 # GitHub Publication Checklist
 
-The local project is initialized on `main` with intentional history and a private staging remote at `https://github.com/DiamondNit3/token-ledger`. Cargo, homepage, documentation, security-reporting, issue-template, CI, and release metadata use that canonical location.
+The public project lives at `https://github.com/DiamondNit3/token-ledger`. Cargo, homepage, documentation, security-reporting, issue-template, CI, and release metadata use that canonical location.
 
-## Before making it public
+## Public release gate
 
 1. Complete the private CI and release workflows for the intended public version.
 2. Download every Windows, Linux, and macOS release archive, verify `SHA256SUMS.txt`, and smoke-test the extracted binaries on their native platforms.
 3. Confirm that the README demo, installation steps, unsigned-binary disclosures, and current limitations match those exact artifacts.
 4. Run the public-content gate and inspect the Git tree for databases, configs, generated reports, environment files, user paths, credentials, and real client records.
-5. Change visibility without announcing the repository, immediately enable GitHub private vulnerability reporting, and test the reporting route before sharing the public URL. GitHub exposes this setting only for public repositories.
+5. Verify GitHub private vulnerability reporting, secret scanning, push protection, protected `main`, the `v*` tag ruleset, and the reviewer-gated `release` environment before sharing a release URL.
 6. Keep `publish = false` unless the separate [crates.io assessment](CRATES_IO.md) is approved.
-7. Change visibility only after branch protection and repository security settings are ready; do not announce the project merely because the repository became public.
+7. Do not announce a release merely because a tag or repository is public; wait for the protected release workflow and independently verify its checksums.
 
 ## Included GitHub configuration
 
@@ -22,13 +22,17 @@ The local project is initialized on `main` with intentional history and a privat
 - Structured issue forms require privacy confirmation for bugs, pricing corrections, and feature requests.
 - The pull-request template requires accounting, compatibility, privacy, and verification review.
 
-## Repository settings to enable manually
+## Enabled repository settings
 
-- Require the CI checks before merging to the default branch.
-- Set default workflow token permissions to read-only.
-- Immediately after public visibility is enabled, turn on private vulnerability reporting and verify the `security/advisories/new` route before announcing the repository.
-- Enable secret scanning and push protection.
-- Enable Dependabot alerts and security updates.
-- Add repository topics such as `rust`, `cli`, `token-usage`, `claude-code`, `codex`, and `cost-tracking`.
+- `main` requires the Windows, Linux, macOS, and Rust 1.88 checks, a pull request, conversation resolution, and CODEOWNER review; force pushes and deletion are disabled.
+- The `release` environment requires explicit approval before publication.
+- An active tag ruleset restricts creation, update, and deletion of `v*` release tags.
+- Private vulnerability reporting, secret scanning, and push protection are enabled.
+- Default workflow permissions are read-only; only the final release job receives `contents: write`.
+- Dependabot monitors Cargo and GitHub Actions dependencies weekly.
+
+## Single-maintainer limitation
+
+The repository currently has one administrator. `main` protection therefore allows the administrator to bypass required checks, and the administrator can approve a release deployment they initiated. These controls prevent accidents and constrain future collaborators, but they are not independent authorization. After adding a second trusted maintainer, enable administrator enforcement on `main`, add that maintainer as a required release reviewer, and prevent self-review. Do not enable those settings with only one reviewer: doing so would make ordinary maintenance and security releases impossible.
 
 See [RELEASING.md](RELEASING.md) for artifact publication and [LAUNCH.md](LAUNCH.md) for the staged community and maintenance gate.
