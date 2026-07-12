@@ -682,6 +682,13 @@ fn migrated_codex_fork_identity_survives_single_source_rebuild() {
     {
         let connection = Connection::open(&fixture.database).expect("open pre-migration ledger");
         connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_replace;",
+            )
+            .expect("emulate pre-v7 schema guards");
+        connection
             .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
             .expect("mark ledger schema v4");
         connection
@@ -718,7 +725,7 @@ fn migrated_codex_fork_identity_survives_single_source_rebuild() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("read migrated fork identity counts");
-    assert_eq!(schema, 6);
+    assert_eq!(schema, 7);
     assert_eq!(observations, 2);
     assert_eq!(canonical_events, 1, "copied boundary was double-counted");
     assert_eq!(
@@ -821,6 +828,13 @@ fn shifted_codex_copy_after_migration_is_provisional_without_duplicate_usage() {
     });
     {
         let connection = Connection::open(&fixture.database).expect("open v4 source ledger");
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+                 DROP TRIGGER IF EXISTS guard_schema_version_no_replace;",
+            )
+            .expect("emulate pre-v7 schema guards");
         connection
             .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
             .expect("mark v4 ledger");

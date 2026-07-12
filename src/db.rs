@@ -19,13 +19,16 @@ use crate::reconcile::{
     ReconciliationRouting, StoredReconciliationBucket,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SCAN_HEARTBEAT_STALE_AFTER_SECS: i64 = 15 * 60;
 const COMPLETED_SCAN_HISTORY_LIMIT: i64 = 256;
 const PRIVACY_MIGRATION_BATCH_SIZE: i64 = 256;
 const V6_PRIVACY_STATE_KEY: &str = "v6_privacy_migration";
 const V6_PRIVACY_PENDING: &str = "cleanup_pending";
 const V6_PRIVACY_COMPLETE: &str = "complete";
+const V7_PRIVACY_BARRIER_KEY: &str = "v7_privacy_barrier";
+const V7_PRIVACY_PENDING: &str = "cleanup_pending";
+const V7_PRIVACY_COMPLETE: &str = "complete";
 const CODEX_ALIAS_SCOPE_CANDIDATE_LIMIT: usize = 3;
 
 pub struct Ledger {
@@ -252,8 +255,18 @@ impl Ledger {
             "#,
         )?;
 
-        let existing: Option<i64> = self
+        // secure_delete must be selected outside a transaction. The EXCLUSIVE
+        // transaction is then acquired *before* reading schema_version and is
+        // retained across every logical migration. A second upgrader therefore
+        // observes the first upgrader's committed version instead of replaying
+        // the same pseudonymization boundary.
+        self.connection.pragma_update(None, "secure_delete", "ON")?;
+        let mut needs_physical_cleanup = false;
+        let mut cleanup_follower = false;
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        let existing: Option<i64> = transaction
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
                 [],
@@ -262,9 +275,6 @@ impl Ledger {
             .optional()?;
         match existing {
             None => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Exclusive)?;
                 ensure_v6_storage_columns(&transaction)?;
                 transaction.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -274,219 +284,157 @@ impl Ledger {
                     "INSERT INTO meta(key, value) VALUES (?1, ?2)",
                     params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_COMPLETE],
                 )?;
-                ensure_v6_identity_indexes(&transaction)?;
-                install_privacy_write_guard_triggers(&transaction)?;
-                transaction.commit()?;
+                transaction.execute(
+                    "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                    params![V7_PRIVACY_BARRIER_KEY, V7_PRIVACY_COMPLETE],
+                )?;
             }
-            Some(version) if version == SCHEMA_VERSION => {
-                // Upgrading an already-created v6 database is intentionally
-                // idempotent: early v0.4 builds did not yet have the write
-                // generation barrier.
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            Some(version @ 1..=6) => {
+                let opened_at_v6 = version == 6;
+                let mut current = version;
+                if current == 1 {
+                    migrate_v1_to_v2(&transaction)?;
+                    current = 2;
+                }
+                if current == 2 {
+                    migrate_v2_to_v3(&transaction)?;
+                    current = 3;
+                }
+                if current == 3 {
+                    advance_schema_version(&transaction, 3, 4)?;
+                    current = 4;
+                }
+                if current == 4 {
+                    scrub_legacy_private_values(&transaction)?;
+                    advance_schema_version(&transaction, 4, 5)?;
+                    current = 5;
+                }
+                if current == 5 {
+                    migrate_v5_to_v6(&transaction)?;
+                    current = 6;
+                }
+                debug_assert_eq!(current, 6);
+                migrate_v6_to_v7(&transaction, opened_at_v6)?;
+                needs_physical_cleanup = true;
+            }
+            Some(SCHEMA_VERSION) => {
                 ensure_v6_storage_columns(&transaction)?;
-                install_privacy_write_guard_triggers(&transaction)?;
-                transaction.commit()?;
-                let privacy_state = self
-                    .connection
+                let state = transaction
                     .query_row(
                         "SELECT value FROM meta WHERE key=?1",
-                        [V6_PRIVACY_STATE_KEY],
+                        [V7_PRIVACY_BARRIER_KEY],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?;
-                match privacy_state.as_deref() {
-                    Some(V6_PRIVACY_COMPLETE) => {
-                        let transaction = self.connection.transaction()?;
-                        ensure_v6_identity_indexes(&transaction)?;
-                        transaction.commit()?;
+                match state.as_deref() {
+                    Some(V7_PRIVACY_COMPLETE) => {}
+                    Some(V7_PRIVACY_PENDING) => {
+                        needs_physical_cleanup = true;
+                        cleanup_follower = true;
                     }
-                    Some(V6_PRIVACY_PENDING) => self.complete_v6_privacy_cleanup()?,
-                    // Development builds briefly wrote schema v6 without a
-                    // durable privacy-completion marker. Treat them as legacy
-                    // inputs and run the idempotence-guarded logical upgrade.
-                    _ => self.migrate_v5_to_v6()?,
+                    _ => anyhow::bail!("database schema v7 is missing its privacy barrier marker"),
                 }
             }
-            Some(1) => {
-                self.migrate_v1_to_v2()?;
-                self.migrate_v2_to_v3()?;
-                self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()?;
-            }
-            Some(2) => {
-                self.migrate_v2_to_v3()?;
-                self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()?;
-            }
-            Some(3) => {
-                self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()?;
-            }
-            Some(4) => {
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()?;
-            }
-            Some(5) => self.migrate_v5_to_v6()?,
             Some(version) => anyhow::bail!(
                 "database schema version {version} is unsupported by this binary (expected {SCHEMA_VERSION})"
             ),
         }
-        Ok(())
-    }
-
-    fn migrate_v1_to_v2(&mut self) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        let source_paths = {
-            let mut statement = transaction.prepare("SELECT id, path FROM source_files")?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, path) in source_paths {
-            transaction.execute(
-                "UPDATE source_files SET path=?1 WHERE id=?2",
-                params![source_storage_key(Path::new(&path)), id],
-            )?;
-        }
-
-        let source_locators = {
-            let mut statement =
-                transaction.prepare("SELECT id, source_locator FROM usage_observations")?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, locator) in source_locators {
-            transaction.execute(
-                "UPDATE usage_observations SET source_locator=?1 WHERE id=?2",
-                params![sanitize_source_locator(&locator), id],
-            )?;
-        }
-        // Older core-generated discovery/source errors could contain absolute
-        // paths. They are diagnostics rather than accounting facts, so remove
-        // only those legacy rows during the privacy migration.
-        transaction.execute(
-            "DELETE FROM scan_warnings WHERE code IN ('discovery_failed', 'source_scan_failed')",
-            [],
-        )?;
-        transaction.execute("UPDATE meta SET value=?1 WHERE key='schema_version'", ["2"])?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn migrate_v2_to_v3(&mut self) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        let columns = {
-            let mut statement = transaction.prepare("PRAGMA table_info(scan_runs)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<HashSet<_>>>()?
-        };
-        for (column, declaration) in [
-            ("heartbeat_at", "TEXT"),
-            ("as_of", "TEXT"),
-            (
-                "active_or_volatile_source_count",
-                "INTEGER NOT NULL DEFAULT 0",
-            ),
-            ("provisional", "INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            if !columns.contains(column) {
-                transaction.execute_batch(&format!(
-                    "ALTER TABLE scan_runs ADD COLUMN {column} {declaration}"
-                ))?;
-            }
-        }
-        transaction.execute(
-            "UPDATE scan_runs SET heartbeat_at=COALESCE(completed_at, started_at), as_of=completed_at, provisional=CASE WHEN status='ok' THEN 0 ELSE 1 END",
-            [],
-        )?;
-        transaction.execute("UPDATE meta SET value=?1 WHERE key='schema_version'", ["3"])?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn migrate_v3_to_v4(&mut self) -> Result<()> {
-        // The tables are created with IF NOT EXISTS in the common schema
-        // bootstrap above. Advancing the marker in its own transaction makes
-        // an interrupted v3 open safely retryable.
-        let transaction = self.connection.transaction()?;
-        transaction.execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn migrate_v4_to_v5(&mut self) -> Result<()> {
-        // This migration is a physical privacy boundary. Secure deletion plus
-        // a post-commit VACUUM removes legacy raw identifiers from database
-        // pages and the surrounding checkpoints truncate copies from the WAL.
-        self.connection.pragma_update(None, "secure_delete", "ON")?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        scrub_legacy_private_values(&transaction)?;
-        transaction.execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
-        transaction.commit()?;
-        checked_wal_checkpoint(&self.connection)?;
-        self.connection.execute_batch("VACUUM")?;
-        checked_wal_checkpoint(&self.connection)?;
-        Ok(())
-    }
-
-    fn migrate_v5_to_v6(&mut self) -> Result<()> {
-        self.connection.pragma_update(None, "secure_delete", "ON")?;
-        // This writer transaction serializes the privacy boundary with every
-        // already-active legacy writer. A legacy write either commits before
-        // this transaction and is scrubbed below, or runs after it and is
-        // rejected by the generation triggers installed atomically here.
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        drop_privacy_write_guard_triggers(&transaction)?;
-        ensure_v6_storage_columns(&transaction)?;
-        recreate_v6_identity_tables(&transaction)?;
-        backfill_codex_event_identity_aliases(&transaction)?;
-        rescrub_v5_private_values(&transaction)?;
-        transaction.execute(
-            "UPDATE meta SET value=?1 WHERE key='schema_version'",
-            [SCHEMA_VERSION.to_string()],
-        )?;
-        transaction.execute(
-            r#"INSERT INTO meta(key, value) VALUES (?1, ?2)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
-            params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_PENDING],
-        )?;
-        install_privacy_write_guard_triggers(&transaction)?;
-        transaction.commit()?;
-        self.complete_v6_privacy_cleanup()?;
-        Ok(())
-    }
-
-    fn complete_v6_privacy_cleanup(&mut self) -> Result<()> {
-        self.connection.pragma_update(None, "secure_delete", "ON")?;
-        checked_wal_checkpoint(&self.connection)?;
-        self.connection.execute_batch("VACUUM")?;
-        checked_wal_checkpoint(&self.connection)?;
-        let transaction = self.connection.transaction()?;
         ensure_v6_identity_indexes(&transaction)?;
-        transaction.execute(
-            r#"INSERT INTO meta(key, value) VALUES (?1, ?2)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
-            params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_COMPLETE],
-        )?;
+        install_privacy_write_guard_triggers(&transaction)?;
+        install_schema_version_guard_triggers(&transaction)?;
         transaction.commit()?;
+
+        if needs_physical_cleanup {
+            if cleanup_follower {
+                // The process that advanced the schema owns the first cleanup
+                // attempt. A follower that observed an already-pending barrier
+                // waits so two VACUUM/checkpoint loops do not contend in
+                // lockstep. If the owner crashed or failed, this process still
+                // takes over after the bounded grace period.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            self.complete_v7_privacy_cleanup()?;
+        }
         Ok(())
+    }
+
+    fn complete_v7_privacy_cleanup(&mut self) -> Result<()> {
+        const CLEANUP_RETRY_ATTEMPTS: usize = 100;
+        const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+        const CLEANUP_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
+
+        // The normal five-second SQLite busy timeout would apply to every
+        // checkpoint attempt and accidentally turn this bounded retry loop
+        // into a many-minute wait behind one live WAL reader. Use a short
+        // per-attempt timeout here, then restore the normal connection policy
+        // on every exit path.
+        self.connection.busy_timeout(CLEANUP_BUSY_TIMEOUT)?;
+        let cleanup = (|| -> Result<()> {
+            let mut physically_clean = false;
+            for _ in 0..CLEANUP_RETRY_ATTEMPTS {
+                let state = self
+                    .connection
+                    .query_row(
+                        "SELECT value FROM meta WHERE key=?1",
+                        [V7_PRIVACY_BARRIER_KEY],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if state.as_deref() == Some(V7_PRIVACY_COMPLETE) {
+                    return Ok(());
+                }
+                if !wal_checkpoint_complete(&self.connection)? {
+                    std::thread::sleep(CLEANUP_RETRY_DELAY);
+                    continue;
+                }
+                match self.connection.execute_batch("VACUUM") {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if matches!(
+                            error.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) =>
+                    {
+                        std::thread::sleep(CLEANUP_RETRY_DELAY);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                if wal_checkpoint_complete(&self.connection)? {
+                    physically_clean = true;
+                    break;
+                }
+                std::thread::sleep(CLEANUP_RETRY_DELAY);
+            }
+            if !physically_clean {
+                anyhow::bail!("privacy cleanup could not obtain a complete SQLite WAL checkpoint");
+            }
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            let version: i64 = transaction.query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if version != SCHEMA_VERSION {
+                anyhow::bail!(
+                    "database schema changed during privacy cleanup (found {version}, expected {SCHEMA_VERSION})"
+                );
+            }
+            ensure_v6_identity_indexes(&transaction)?;
+            transaction.execute(
+                r#"INSERT INTO meta(key, value) VALUES (?1, ?2)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
+                params![V7_PRIVACY_BARRIER_KEY, V7_PRIVACY_COMPLETE],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let restore = self
+            .connection
+            .busy_timeout(std::time::Duration::from_secs(5));
+        cleanup.and(restore.map_err(Into::into))
     }
 
     /// Atomically acquires the single-writer scan lease. A live lease is
@@ -1507,6 +1455,121 @@ impl Ledger {
     }
 }
 
+fn advance_schema_version(transaction: &Transaction<'_>, expected: i64, next: i64) -> Result<()> {
+    let changed = transaction.execute(
+        r#"UPDATE meta SET value=?1
+           WHERE key='schema_version' AND CAST(value AS INTEGER)=?2"#,
+        params![next.to_string(), expected],
+    )?;
+    if changed != 1 {
+        anyhow::bail!(
+            "database schema changed during migration (expected {expected} before advancing to {next})"
+        );
+    }
+    Ok(())
+}
+
+fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<()> {
+    let source_paths = {
+        let mut statement = transaction.prepare("SELECT id, path FROM source_files")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, path) in source_paths {
+        transaction.execute(
+            "UPDATE source_files SET path=?1 WHERE id=?2",
+            params![source_storage_key(Path::new(&path)), id],
+        )?;
+    }
+
+    let source_locators = {
+        let mut statement =
+            transaction.prepare("SELECT id, source_locator FROM usage_observations")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, locator) in source_locators {
+        transaction.execute(
+            "UPDATE usage_observations SET source_locator=?1 WHERE id=?2",
+            params![sanitize_source_locator(&locator), id],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM scan_warnings WHERE code IN ('discovery_failed', 'source_scan_failed')",
+        [],
+    )?;
+    advance_schema_version(transaction, 1, 2)
+}
+
+fn migrate_v2_to_v3(transaction: &Transaction<'_>) -> Result<()> {
+    let columns = table_columns(transaction, "scan_runs")?;
+    for (column, declaration) in [
+        ("heartbeat_at", "TEXT"),
+        ("as_of", "TEXT"),
+        (
+            "active_or_volatile_source_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("provisional", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.contains(column) {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE scan_runs ADD COLUMN {column} {declaration}"
+            ))?;
+        }
+    }
+    transaction.execute(
+        "UPDATE scan_runs SET heartbeat_at=COALESCE(completed_at, started_at), as_of=completed_at, provisional=CASE WHEN status='ok' THEN 0 ELSE 1 END",
+        [],
+    )?;
+    advance_schema_version(transaction, 2, 3)
+}
+
+fn migrate_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
+    drop_privacy_write_guard_triggers(transaction)?;
+    ensure_v6_storage_columns(transaction)?;
+    recreate_v6_identity_tables(transaction)?;
+    backfill_codex_event_identity_aliases(transaction)?;
+    rescrub_v5_private_values(transaction)?;
+    advance_schema_version(transaction, 5, 6)?;
+    transaction.execute(
+        r#"INSERT INTO meta(key, value) VALUES (?1, ?2)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
+        params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_PENDING],
+    )?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(transaction: &Transaction<'_>, invalidate_pre_barrier_v6: bool) -> Result<()> {
+    ensure_v6_storage_columns(transaction)?;
+    if invalidate_pre_barrier_v6 {
+        // A schema-v6 completion marker cannot prove that a v0.3 writer did
+        // not reintroduce raw identifiers after v0.4.0 scrubbed the database.
+        // Hashing these mixed rows again would also double-hash legitimate v6
+        // pseudonyms. Invalidate the identifier-bearing accounting cache and
+        // let the next scan rebuild it from its authoritative local sources.
+        transaction.execute("DELETE FROM reconciliation_buckets", [])?;
+        transaction.execute("DELETE FROM reconciliation_imports", [])?;
+        transaction.execute("DELETE FROM scan_warnings", [])?;
+        transaction.execute("DELETE FROM scan_runs", [])?;
+        transaction.execute("DELETE FROM usage_observations", [])?;
+        transaction.execute("DELETE FROM source_files", [])?;
+    }
+    advance_schema_version(transaction, 6, 7)?;
+    transaction.execute(
+        r#"INSERT INTO meta(key, value) VALUES (?1, ?2)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
+        params![V7_PRIVACY_BARRIER_KEY, V7_PRIVACY_PENDING],
+    )?;
+    Ok(())
+}
+
 fn ensure_v6_storage_columns(transaction: &Transaction<'_>) -> Result<()> {
     let source_columns = table_columns(transaction, "source_files")?;
     if !source_columns.contains("privacy_write_generation") {
@@ -1568,59 +1631,96 @@ fn install_privacy_write_guard_triggers(transaction: &Transaction<'_>) -> Result
         r#"
         CREATE TRIGGER guard_source_files_v6_insert
         BEFORE INSERT ON source_files
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_source_files_v6_update
         BEFORE UPDATE ON source_files
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_usage_observations_v6_insert
         BEFORE INSERT ON usage_observations
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_usage_observations_v6_update
         BEFORE UPDATE ON usage_observations
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_scan_warnings_v6_insert
         BEFORE INSERT ON scan_warnings
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_scan_warnings_v6_update
         BEFORE UPDATE ON scan_warnings
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_reconciliation_imports_v6_insert
         BEFORE INSERT ON reconciliation_imports
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_reconciliation_imports_v6_update
         BEFORE UPDATE ON reconciliation_imports
-        WHEN (SELECT value FROM meta WHERE key='schema_version')='6'
+        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn install_schema_version_guard_triggers(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+        DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+        DROP TRIGGER IF EXISTS guard_schema_version_no_replace;
+        CREATE TRIGGER guard_schema_version_no_downgrade
+        BEFORE UPDATE ON meta
+        WHEN OLD.key='schema_version'
+             AND (
+                 NEW.key<>'schema_version'
+                 OR CAST(NEW.value AS INTEGER)<CAST(OLD.value AS INTEGER)
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'database schema downgrade rejected');
+        END;
+        CREATE TRIGGER guard_schema_version_no_delete
+        BEFORE DELETE ON meta
+        WHEN OLD.key='schema_version'
+        BEGIN
+            SELECT RAISE(ABORT, 'database schema downgrade rejected');
+        END;
+        CREATE TRIGGER guard_schema_version_no_replace
+        BEFORE INSERT ON meta
+        WHEN NEW.key='schema_version'
+             AND EXISTS(SELECT 1 FROM meta WHERE key='schema_version')
+             AND CAST(NEW.value AS INTEGER)<CAST(
+                 (SELECT value FROM meta WHERE key='schema_version') AS INTEGER
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'database schema downgrade rejected');
         END;
         "#,
     )?;
@@ -2219,7 +2319,7 @@ fn ensure_v6_identity_indexes(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-fn checked_wal_checkpoint(connection: &Connection) -> Result<()> {
+fn wal_checkpoint_complete(connection: &Connection) -> Result<bool> {
     let (busy, log_frames, checkpointed_frames) =
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((
@@ -2228,10 +2328,7 @@ fn checked_wal_checkpoint(connection: &Connection) -> Result<()> {
                 row.get::<_, i64>(2)?,
             ))
         })?;
-    if busy != 0 || (log_frames >= 0 && checkpointed_frames < log_frames) {
-        anyhow::bail!("privacy cleanup could not obtain a complete SQLite WAL checkpoint");
-    }
-    Ok(())
+    Ok(busy == 0 && (log_frames < 0 || checkpointed_frames >= log_frames))
 }
 
 fn rescrub_v5_private_values(transaction: &Transaction<'_>) -> Result<()> {
@@ -3031,6 +3128,19 @@ mod tests {
     use std::thread;
     use tempfile::tempdir;
 
+    fn emulate_legacy_schema(connection: &Connection, version: i64) -> Result<()> {
+        connection.execute_batch(
+            "DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+             DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+             DROP TRIGGER IF EXISTS guard_schema_version_no_replace;",
+        )?;
+        connection.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version'",
+            [version.to_string()],
+        )?;
+        Ok(())
+    }
+
     fn observation(source: &str, timestamp: i64, output: u64) -> UsageObservation {
         UsageObservation {
             event_key: "shared".into(),
@@ -3671,9 +3781,7 @@ mod tests {
                 "physical_thread_id": THREAD,
                 "unknown_transcript_field": TRANSCRIPT
             });
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 4)?;
             ledger.connection.execute(
                 r#"UPDATE usage_observations SET event_key=?1, session_id=?2,
                           provider_message_id=?3, dimensions_json=?4,
@@ -3869,9 +3977,7 @@ mod tests {
 
             // Recreate the prefix-trusting schema-v5 storage bug: both the
             // observation and parser state retained the provider lookalike.
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
             let legacy_state = serde_json::json!({
                 "canonical_meta_seen": true,
                 "logical_session_id": LOOKALIKE,
@@ -3893,7 +3999,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         let checkpoint = ledger.source_checkpoint(&source_path)?.expect("checkpoint");
         assert_eq!(checkpoint.checkpoint_offset, 0);
         assert!(checkpoint.adapter_state.is_null());
@@ -3995,9 +4101,7 @@ mod tests {
                     "physical_thread_id": THREAD,
                     "usage_event_index": 1
                 });
-                ledger
-                    .connection
-                    .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+                emulate_legacy_schema(&ledger.connection, 5)?;
                 ledger.connection.execute(
                     r#"UPDATE source_files SET adapter_state=?1 WHERE id=?2"#,
                     params![crafted_state.to_string(), source_id],
@@ -4089,9 +4193,7 @@ mod tests {
                 scan_run_id: run,
             })?;
             ledger.finish_scan(run, 1, 1, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
         }
 
         // This connection represents v0.3: it opened the old schema before
@@ -4155,6 +4257,204 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pre_barrier_v6_cache_is_invalidated_instead_of_blessing_contamination() -> Result<()> {
+        const RAW_SESSION: &str = "raw-session-reintroduced-after-v040-migration";
+
+        let directory = tempdir()?;
+        let database = directory.path().join("contaminated-v040.sqlite");
+        {
+            let mut ledger = Ledger::open(&database)?;
+            let run = ledger.start_scan("test")?;
+            let source_id = ledger.ensure_source(
+                Client::ClaudeCode,
+                &directory.path().join("source.jsonl"),
+                false,
+            )?;
+            ledger.apply_source_update(SourceUpdate {
+                source_id,
+                reset_observations: false,
+                file_size: 1,
+                modified_ns: 1,
+                checkpoint_offset: 1,
+                checkpoint_line: 1,
+                checkpoint_hash: "",
+                head_hash: "",
+                adapter_state: &serde_json::Value::Null,
+                observations: &[observation("safe", 1, 2)],
+                warnings: &[],
+                scan_run_id: run,
+            })?;
+            ledger.finish_scan(run, 1, 1, 0, "ok")?;
+
+            emulate_legacy_schema(&ledger.connection, 6)?;
+            let transaction = ledger.connection.transaction()?;
+            drop_privacy_write_guard_triggers(&transaction)?;
+            transaction.execute(
+                "UPDATE usage_observations SET session_id=?1, privacy_write_generation=1",
+                [RAW_SESSION],
+            )?;
+            transaction.execute(
+                r#"INSERT INTO meta(key, value) VALUES (?1, ?2)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value"#,
+                params![V6_PRIVACY_STATE_KEY, V6_PRIVACY_COMPLETE],
+            )?;
+            transaction.execute("DELETE FROM meta WHERE key=?1", [V7_PRIVACY_BARRIER_KEY])?;
+            transaction.commit()?;
+        }
+
+        let ledger = Ledger::open(&database)?;
+        let (version, barrier, sources, observations): (i64, String, i64, i64) =
+            ledger.connection.query_row(
+                r#"SELECT
+                       (SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'),
+                       (SELECT value FROM meta WHERE key=?1),
+                       (SELECT COUNT(*) FROM source_files),
+                       (SELECT COUNT(*) FROM usage_observations)"#,
+                [V7_PRIVACY_BARRIER_KEY],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(barrier, V7_PRIVACY_COMPLETE);
+        assert_eq!(sources, 0);
+        assert_eq!(observations, 0);
+        let guard_count: i64 = ledger.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'guard_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            guard_count, 11,
+            "eight write guards plus three schema guards"
+        );
+
+        let legacy = Connection::open(&database)?;
+        let error = legacy
+            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
+            .expect_err("a delayed legacy migrator must not downgrade the barrier");
+        assert!(error.to_string().contains("schema downgrade rejected"));
+        let error = legacy
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '4')",
+                [],
+            )
+            .expect_err("replacement must not bypass the downgrade barrier");
+        assert!(error.to_string().contains("schema downgrade rejected"));
+        drop(ledger);
+        assert_database_family_excludes(&database, &[RAW_SESSION])?;
+        Ok(())
+    }
+
+    #[test]
+    fn simultaneous_v5_migrators_hash_each_identifier_exactly_once() -> Result<()> {
+        const RAW_SESSION: &str = "simultaneous-v5-migration-session";
+        const ROW_COUNT: usize = 10_000;
+
+        let directory = tempdir()?;
+        let database = directory.path().join("simultaneous-v5.sqlite");
+        {
+            let mut ledger = Ledger::open(&database)?;
+            let run = ledger.start_scan("test")?;
+            let source_id = ledger.ensure_source(
+                Client::ClaudeCode,
+                &directory.path().join("source.jsonl"),
+                false,
+            )?;
+            let mut first = observation(RAW_SESSION, 1, 2);
+            first.event_key = "event-0".to_string();
+            ledger.apply_source_update(SourceUpdate {
+                source_id,
+                reset_observations: false,
+                file_size: 1,
+                modified_ns: 1,
+                checkpoint_offset: 1,
+                checkpoint_line: 1,
+                checkpoint_hash: "",
+                head_hash: "",
+                adapter_state: &serde_json::Value::Null,
+                observations: &[first],
+                warnings: &[],
+                scan_run_id: run,
+            })?;
+            ledger.finish_scan(run, 1, 1, 0, "ok")?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
+            ledger
+                .connection
+                .execute("UPDATE usage_observations SET session_id=?1", [RAW_SESSION])?;
+            let transaction = ledger.connection.transaction()?;
+            for ordinal in 1..ROW_COUNT {
+                transaction.execute(
+                    r#"INSERT INTO usage_observations(
+                           source_file_id, event_key, client, session_id,
+                           provider_message_id, occurred_at_utc, raw_model, provider,
+                           input_tokens_total, input_tokens_uncached, input_tokens_cached,
+                           cache_write_5m_tokens, cache_write_1h_tokens,
+                           cache_write_unknown_tokens, output_tokens_total,
+                           reasoning_output_tokens, web_search_requests, web_fetch_requests,
+                           dimensions_json, quality_rank, coverage, source_locator,
+                           parser_version, warnings_json, privacy_write_generation)
+                       SELECT source_file_id, ?1, client, ?2, provider_message_id,
+                              occurred_at_utc, raw_model, provider, input_tokens_total,
+                              input_tokens_uncached, input_tokens_cached,
+                              cache_write_5m_tokens, cache_write_1h_tokens,
+                              cache_write_unknown_tokens, output_tokens_total,
+                              reasoning_output_tokens, web_search_requests,
+                              web_fetch_requests, dimensions_json, quality_rank,
+                              coverage, source_locator, parser_version, warnings_json,
+                              privacy_write_generation
+                       FROM usage_observations WHERE id=1"#,
+                    params![format!("event-{ordinal}"), RAW_SESSION],
+                )?;
+            }
+            transaction.commit()?;
+        }
+
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let database = database.clone();
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || -> Result<()> {
+                start.wait();
+                drop(Ledger::open(&database)?);
+                Ok(())
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            match worker.join().expect("migration thread") {
+                Ok(()) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("WAL checkpoint")
+                            || message.contains("database is locked")
+                            || message.contains("database is busy"),
+                        "simultaneous migration failed for a non-retryable reason: {message}"
+                    );
+                }
+            }
+        }
+
+        // Once every contender has closed its connection, a retry must finish
+        // any pending physical cleanup without replaying logical migration.
+        let ledger = Ledger::open(&database)?;
+        let expected = pseudonymous_session_id(Client::ClaudeCode, RAW_SESSION);
+        let (count, distinct, stored, barrier): (i64, i64, String, String) =
+            ledger.connection.query_row(
+                r#"SELECT COUNT(*), COUNT(DISTINCT session_id), MIN(session_id),
+                          (SELECT value FROM meta WHERE key=?1)
+                   FROM usage_observations"#,
+                [V7_PRIVACY_BARRIER_KEY],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(count, ROW_COUNT as i64);
+        assert_eq!(distinct, 1);
+        assert_eq!(stored, expected);
+        assert_eq!(barrier, V7_PRIVACY_COMPLETE);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn ledger_open_hardens_database_directory_and_sqlite_files() -> Result<()> {
@@ -4211,9 +4511,7 @@ mod tests {
                 scan_run_id: run,
             })?;
             ledger.finish_scan(run, 1, 1, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
             ledger
                 .connection
                 .execute("UPDATE usage_observations SET session_id=?1", [LOOKALIKE])?;
@@ -4241,11 +4539,11 @@ mod tests {
                    (SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'),
                    (SELECT value FROM meta WHERE key=?1),
                    (SELECT session_id FROM usage_observations LIMIT 1)"#,
-            [V6_PRIVACY_STATE_KEY],
+            [V7_PRIVACY_BARRIER_KEY],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(state, V6_PRIVACY_PENDING);
+        assert_eq!(state, V7_PRIVACY_PENDING);
         assert_eq!(
             once_scrubbed,
             pseudonymous_session_id(Client::ClaudeCode, LOOKALIKE)
@@ -4259,10 +4557,10 @@ mod tests {
             r#"SELECT
                    (SELECT value FROM meta WHERE key=?1),
                    (SELECT session_id FROM usage_observations LIMIT 1)"#,
-            [V6_PRIVACY_STATE_KEY],
+            [V7_PRIVACY_BARRIER_KEY],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(state, V6_PRIVACY_COMPLETE);
+        assert_eq!(state, V7_PRIVACY_COMPLETE);
         assert_eq!(
             after_retry, once_scrubbed,
             "retry must not rehash logical rows"
@@ -4314,9 +4612,7 @@ mod tests {
                 scan_run_id: run,
             })?;
             ledger.finish_scan(run, 1, row_count as u64, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
         }
 
         let ledger = Ledger::open(&database)?;
@@ -4411,9 +4707,7 @@ mod tests {
                 scan_run_id: run,
             })?;
             ledger.finish_scan(run, 1, 2, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
         }
 
         let mut ledger = Ledger::open(&database)?;
@@ -4588,9 +4882,7 @@ mod tests {
                 scan_run_id: run,
             })?;
             ledger.finish_scan(run, 1, 2, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
         }
 
         let mut ledger = Ledger::open(&database)?;
@@ -4695,9 +4987,7 @@ mod tests {
                 scan_run_id: run,
             })?;
             ledger.finish_scan(run, 1, 1, 0, "ok")?;
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 5)?;
         }
 
         let mut ledger = Ledger::open(&database)?;
@@ -5083,9 +5373,7 @@ mod tests {
             })?;
 
             // Recreate the privacy-relevant shape of a schema-v1 ledger.
-            ledger
-                .connection
-                .execute("UPDATE meta SET value='1' WHERE key='schema_version'", [])?;
+            emulate_legacy_schema(&ledger.connection, 1)?;
             ledger.connection.execute(
                 "UPDATE source_files SET path=?1 WHERE id=?2",
                 params![source_path.to_string_lossy(), source_id],

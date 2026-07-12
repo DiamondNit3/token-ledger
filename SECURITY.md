@@ -8,7 +8,7 @@ Security fixes are made against the latest released minor version. Older local b
 
 Do not publish a report that contains session logs, prompts, source paths, account identifiers, database contents, configuration files, or credentials.
 
-For the public project, use [GitHub private vulnerability reporting](https://github.com/DiamondNit3/token-ledger/security/advisories/new). GitHub makes this reporter-facing feature available only after the repository is public and a maintainer enables it. During private staging, disclose through the private channel by which you received access. Do not open a public issue for a suspected vulnerability. Send the smallest synthetic reproduction possible.
+Use [GitHub private vulnerability reporting](https://github.com/DiamondNit3/token-ledger/security/advisories/new). It is enabled for this public repository. Do not open a public issue for a suspected vulnerability. Send the smallest synthetic reproduction possible.
 
 A useful report includes:
 

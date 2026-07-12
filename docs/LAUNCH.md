@@ -55,19 +55,24 @@ Follow with the GIF, three commands, source link, binary checksums, accounting c
 
 Treat the first public release as the start, not the finish.
 
-### Release 1 — v0.4.0
+### Prelaunch candidate — v0.4.0
 
 - Harden completeness, rewrite detection, identifiers, and resource limits.
 - Establish demo, GIF, multi-platform binaries, checksums, and public security reporting.
 - Respond to valid bug and privacy reports promptly; document every known format gap.
 
-### Release 2 — v0.4.1 or v0.5.0
+### Prelaunch security patch — v0.4.1
+
+- Close mixed-version privacy writes and publish the first protected release pipeline.
+- Treat follow-up migration and scanner findings as launch blockers, not post-launch feedback.
+
+### Release 1 — v0.5.0
 
 - Incorporate real-world format feedback through synthetic reproductions.
 - Publish a compatibility matrix and installation failure notes by platform.
 - Report which launch claims held up and which were corrected.
 
-### Release 3 — v0.4.2 or v0.6.0
+### Release 2 — v0.6.0
 
 - Close the most common onboarding and correctness issues.
 - Decide on crates.io based on demonstrated maintenance capacity.

@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -22,6 +22,7 @@ const CHECKPOINT_WINDOW: u64 = 4096;
 const EXACT_FINGERPRINT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SOURCES_PER_ADAPTER_SCAN: usize = 4_096;
 const SOURCE_STABILITY_ATTEMPTS: usize = 3;
+const MAX_SOURCE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct ParseLimits {
@@ -55,7 +56,10 @@ const DEFAULT_SCAN_LIMITS: ScanLimits = ScanLimits {
     max_total_records: 5_000_000,
     max_total_observations: 2_000_000,
     max_total_warnings: 100_000,
-    max_source_file_bytes: 512 * 1024 * 1024,
+    // Keep the largest admitted source within the conservative 2 GiB
+    // aggregate-work estimate. A source above this bound is an explicit hard
+    // stop rather than a permanently starved item in the rotating scheduler.
+    max_source_file_bytes: MAX_SOURCE_FILE_BYTES,
     plain: ParseLimits {
         max_bytes: 64 * 1024 * 1024,
         max_line_bytes: 8 * 1024 * 1024,
@@ -375,6 +379,10 @@ fn scan_with_limits(
                 if let Some(run_id) = scan_run_id {
                     ledger.heartbeat_scan(run_id)?;
                 }
+                let mut work_reservation = SourceWorkReservation {
+                    reserved_bytes: estimated_work,
+                    remaining_bytes: &mut remaining_work_bytes,
+                };
                 match scan_one(
                     ledger,
                     adapter.as_ref(),
@@ -382,6 +390,7 @@ fn scan_with_limits(
                     options,
                     scan_run_id,
                     source_limits,
+                    &mut work_reservation,
                 ) {
                     Ok(SourceOutcome::Unchanged {
                         fingerprint,
@@ -752,16 +761,24 @@ fn rotating_window_start(seed: usize, window: usize, source_count: usize) -> usi
 /// parsing, and decompression. Reserving this before opening a source keeps one
 /// invocation's aggregate work finite even when discovery returns many files.
 fn estimate_source_work(source: &SourceSpec, limits: ScanLimits) -> Result<u64> {
-    let metadata = std::fs::metadata(&source.path)?;
+    let file = open_source_file(&source.path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         anyhow::bail!("source is not a regular file");
     }
-    let file_size = metadata.len();
+    Ok(estimate_source_work_for_size(
+        metadata.len(),
+        source.compressed,
+        limits,
+    ))
+}
+
+fn estimate_source_work_for_size(file_size: u64, compressed: bool, limits: ScanLimits) -> u64 {
     if file_size > limits.max_source_file_bytes {
-        return Ok(1024 * 1024);
+        return 1024 * 1024;
     }
 
-    let parse_bytes = if source.compressed {
+    let parse_bytes = if compressed {
         limits.compressed.max_bytes
     } else {
         file_size.min(limits.plain.max_bytes)
@@ -772,14 +789,14 @@ fn estimate_source_work(source: &SourceSpec, limits: ScanLimits) -> Result<u64> 
             .saturating_add(parse_bytes.saturating_mul(3))
             .saturating_add(1024 * 1024)
     } else {
-        let compressed_input = if source.compressed { file_size } else { 0 };
+        let compressed_input = if compressed { file_size } else { 0 };
         file_size
             .saturating_mul(8)
             .saturating_add(parse_bytes.saturating_mul(3))
             .saturating_add(compressed_input.saturating_mul(3))
             .saturating_add(1024 * 1024)
     };
-    Ok(estimate.max(1))
+    estimate.max(1)
 }
 
 enum SourceOutcome {
@@ -799,6 +816,26 @@ enum SourceOutcome {
     },
     Limited(ScanWarning),
     Volatile,
+}
+
+struct SourceWorkReservation<'a> {
+    reserved_bytes: u64,
+    remaining_bytes: &'a mut u64,
+}
+
+impl SourceWorkReservation<'_> {
+    fn admit(&mut self, opened_work: u64) -> bool {
+        if opened_work <= self.reserved_bytes {
+            return true;
+        }
+        let additional = opened_work - self.reserved_bytes;
+        if additional > *self.remaining_bytes {
+            return false;
+        }
+        *self.remaining_bytes -= additional;
+        self.reserved_bytes = opened_work;
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,28 +874,35 @@ fn scan_one(
     options: &ScanOptions,
     scan_run_id: Option<i64>,
     limits: ScanLimits,
+    work_reservation: &mut SourceWorkReservation<'_>,
 ) -> Result<SourceOutcome> {
-    let metadata = std::fs::metadata(&source.path)?;
-    if !metadata.is_file() {
-        anyhow::bail!("source is not a regular file");
-    }
-    if metadata.len() > limits.max_source_file_bytes {
-        return Ok(SourceOutcome::Limited(ScanWarning::new(
-            "source_file_limit",
-            "source exceeded the bounded file-size limit and was not read",
-        )));
-    }
     let mut active_during_scan = false;
     for attempt in 0..SOURCE_STABILITY_ATTEMPTS {
-        let before = source_fingerprint(&source.path)
-            .with_context(|| format!("failed to fingerprint {}", source.path.display()))?;
-        if before.file_size > limits.max_source_file_bytes {
+        // Open without following links, then use this verified handle for the
+        // complete fingerprint, checkpoint validation, and parse. The work
+        // reservation is revalidated from this handle so a pathname swap
+        // cannot turn a small scheduled source into unmetered work.
+        let file = open_source_file(&source.path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            anyhow::bail!("source is not a regular file");
+        }
+        if metadata.len() > limits.max_source_file_bytes {
             return Ok(SourceOutcome::Limited(ScanWarning::new(
                 "source_file_limit",
                 "source exceeded the bounded file-size limit and was not read",
             )));
         }
-        let prepared = prepare_source(ledger, adapter, source, options, &before, limits);
+        let opened_work = estimate_source_work_for_size(metadata.len(), source.compressed, limits);
+        if !work_reservation.admit(opened_work) {
+            return Ok(SourceOutcome::Limited(ScanWarning::new(
+                "scan_resource_limit",
+                "source changed after scheduling and exceeded the remaining aggregate work budget; it was not read",
+            )));
+        }
+        let before = source_fingerprint_from_file(&file)
+            .with_context(|| format!("failed to fingerprint {}", source.path.display()))?;
+        let prepared = prepare_source(ledger, adapter, source, options, &file, &before, limits);
         let after = source_fingerprint(&source.path);
 
         let stable = after
@@ -882,11 +926,12 @@ fn scan_one(
             PreparedSource::Scanned(prepared) => {
                 let observation_count = prepared.batch.observations.len() as u64;
                 let warning_count = prepared.batch.warnings.len() as u64;
-                let resource_limited = prepared
-                    .batch
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.code == "source_resource_limit");
+                let resource_limited = prepared.batch.warnings.iter().any(|warning| {
+                    matches!(
+                        warning.code.as_str(),
+                        "source_resource_limit" | "compressed_archive_unsupported"
+                    )
+                });
                 if !options.dry_run {
                     let run_id = scan_run_id.context("non-dry scan is missing a scan run")?;
                     // Re-check the lease after parsing. If a long-running parse
@@ -932,6 +977,7 @@ fn prepare_source(
     adapter: &dyn SourceAdapter,
     source: &SourceSpec,
     options: &ScanOptions,
+    file: &File,
     fingerprint: &SourceFingerprint,
     limits: ScanLimits,
 ) -> Result<PreparedSource> {
@@ -967,8 +1013,8 @@ fn prepare_source(
             modified_ns,
             &fingerprint.sample_hash,
         )
-        && checkpoint_still_valid(
-            &source.path,
+        && checkpoint_still_valid_file(
+            file,
             existing
                 .as_ref()
                 .expect("unchanged metadata requires a checkpoint"),
@@ -991,7 +1037,7 @@ fn prepare_source(
                 && checkpoint.content_hash != fingerprint.sample_hash)
             || requires_backfill(checkpoint, file_size)
             || (file_size <= checkpoint.file_size && modified_ns != checkpoint.modified_ns)
-            || !checkpoint_still_valid(&source.path, checkpoint)?
+            || !checkpoint_still_valid_file(file, checkpoint)?
         {
             reset = true;
             (0, 0, Value::Null)
@@ -1007,6 +1053,7 @@ fn prepare_source(
     let parsed = if source.compressed {
         parse_compressed(
             adapter,
+            file.try_clone()?,
             &source.path,
             options.since,
             limits.compressed,
@@ -1015,9 +1062,12 @@ fn prepare_source(
     } else {
         parse_plain(
             adapter,
+            file.try_clone()?,
             &source.path,
-            start_offset,
-            start_line,
+            ParseStart {
+                offset: start_offset,
+                line: start_line,
+            },
             &mut state,
             options.since,
             limits.plain,
@@ -1025,17 +1075,12 @@ fn prepare_source(
     };
     if source.compressed {
         state = parsed.next_state.clone();
-        if !parsed.complete
-            && parsed
-                .batch
-                .warnings
-                .iter()
-                .any(|warning| warning.code == "source_resource_limit")
-        {
+        if !parsed.complete {
             // Compressed streams are not seekable using the durable source
-            // checkpoint. Never replace accounting with a prefix that cannot
-            // advance on a later scan. Persist only a content-bound hard-stop
-            // marker so unchanged archives fail quickly and deterministically.
+            // checkpoint. Every incomplete result is therefore all-or-nothing,
+            // including oversized records, truncated tails, adapter-level
+            // gaps, and count/byte bounds. Never replace accounting with a
+            // prefix that cannot advance on a later scan.
             state = serde_json::json!({
                 "compressed_archive_unsupported": true,
                 "compressed_source_hash": fingerprint.sample_hash,
@@ -1049,8 +1094,8 @@ fn prepare_source(
                 modified_ns,
                 checkpoint_offset: 0,
                 checkpoint_line: 0,
-                checkpoint_hash: hash_window_ending_at(&source.path, 0)?,
-                head_hash: hash_head(&source.path, 0)?,
+                checkpoint_hash: hash_window_ending_at_file(file, 0)?,
+                head_hash: hash_head_file(file, 0)?,
                 persisted_state: state,
                 content_hash: fingerprint.sample_hash.clone(),
                 batch: ParseBatch {
@@ -1087,8 +1132,8 @@ fn prepare_source(
     } else {
         state.clone()
     };
-    let checkpoint_hash = hash_window_ending_at(&source.path, checkpoint_offset)?;
-    let head_hash = hash_head(&source.path, checkpoint_offset)?;
+    let checkpoint_hash = hash_window_ending_at_file(file, checkpoint_offset)?;
+    let head_hash = hash_head_file(file, checkpoint_offset)?;
     Ok(PreparedSource::Scanned(Box::new(PreparedSourceUpdate {
         reset,
         complete: options.since.is_none() && parsed.complete,
@@ -1122,17 +1167,22 @@ struct ParseContext<'a> {
     limits: ParseLimits,
 }
 
+#[derive(Clone, Copy)]
+struct ParseStart {
+    offset: u64,
+    line: u64,
+}
+
 fn parse_plain(
     adapter: &dyn SourceAdapter,
+    mut file: File,
     path: &Path,
-    start_offset: u64,
-    start_line: u64,
+    start: ParseStart,
     state: &mut Value,
     since: Option<DateTime<Utc>>,
     limits: ParseLimits,
 ) -> Result<ParsedSource> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start_offset))?;
+    file.seek(SeekFrom::Start(start.offset))?;
     let reader = BufReader::new(file);
     let context = ParseContext {
         adapter,
@@ -1140,17 +1190,18 @@ fn parse_plain(
         since,
         limits,
     };
-    parse_reader(&context, reader, start_offset, start_line, state)
+    parse_reader(&context, reader, start.offset, start.line, state)
 }
 
 fn parse_compressed(
     adapter: &dyn SourceAdapter,
+    mut file: File,
     path: &Path,
     since: Option<DateTime<Utc>>,
     limits: ParseLimits,
     window_log_max: u32,
 ) -> Result<ParsedSource> {
-    let file = File::open(path)?;
+    file.seek(SeekFrom::Start(0))?;
     let mut decoder = zstd::stream::read::Decoder::new(file)
         .with_context(|| format!("failed to open zstd source {}", path.display()))?;
     decoder
@@ -1407,7 +1458,7 @@ fn resource_limit_warning(offset: u64, line_number: u64) -> ScanWarning {
 fn compressed_archive_limit_warning() -> ScanWarning {
     ScanWarning::new(
         "compressed_archive_unsupported",
-        "compressed source exceeds the supported decompressed-size or record limit; no partial usage was imported",
+        "compressed source could not be parsed completely within supported integrity and resource bounds; no partial usage was imported",
     )
 }
 
@@ -1436,19 +1487,32 @@ fn checkpoint_is_partial(checkpoint: &SourceCheckpoint) -> bool {
     checkpoint.checkpoint_offset < checkpoint.file_size
 }
 
-fn checkpoint_still_valid(path: &Path, checkpoint: &SourceCheckpoint) -> Result<bool> {
-    if checkpoint.head_hash != hash_head(path, checkpoint.checkpoint_offset)? {
+fn checkpoint_still_valid_file(file: &File, checkpoint: &SourceCheckpoint) -> Result<bool> {
+    if checkpoint.head_hash != hash_head_file(file, checkpoint.checkpoint_offset)? {
         return Ok(false);
     }
-    Ok(checkpoint.checkpoint_hash == hash_window_ending_at(path, checkpoint.checkpoint_offset)?)
+    Ok(checkpoint.checkpoint_hash
+        == hash_window_ending_at_file(file, checkpoint.checkpoint_offset)?)
 }
 
+#[cfg(test)]
 fn hash_head(path: &Path, checkpoint_offset: u64) -> Result<String> {
-    hash_exact_prefix(path, checkpoint_offset)
+    let file = open_source_file(path)?;
+    hash_head_file(&file, checkpoint_offset)
 }
 
+fn hash_head_file(file: &File, checkpoint_offset: u64) -> Result<String> {
+    hash_exact_prefix_file(file, checkpoint_offset)
+}
+
+#[cfg(test)]
 fn hash_window_ending_at(path: &Path, offset: u64) -> Result<String> {
-    let mut file = File::open(path)?;
+    let file = open_source_file(path)?;
+    hash_window_ending_at_file(&file, offset)
+}
+
+fn hash_window_ending_at_file(file: &File, offset: u64) -> Result<String> {
+    let mut file = file.try_clone()?;
     let start = offset.saturating_sub(CHECKPOINT_WINDOW);
     file.seek(SeekFrom::Start(start))?;
     let mut buffer = vec![0_u8; (offset - start) as usize];
@@ -1462,7 +1526,12 @@ fn hash_window_ending_at(path: &Path, offset: u64) -> Result<String> {
 /// prevent a same-size, timestamp-preserving rewrite outside sample windows
 /// from retaining stale accounting.
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
-    let metadata = std::fs::metadata(path)?;
+    let file = open_source_file(path)?;
+    source_fingerprint_from_file(&file)
+}
+
+fn source_fingerprint_from_file(file: &File) -> Result<SourceFingerprint> {
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         anyhow::bail!("source is not a regular file");
     }
@@ -1470,18 +1539,63 @@ fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     Ok(SourceFingerprint {
         file_size,
         modified_ns: modified_ns(&metadata),
-        sample_hash: hash_exact_prefix(path, file_size)?,
+        sample_hash: hash_exact_prefix_file(file, file_size)?,
         exhaustive: true,
     })
 }
 
-fn hash_exact_prefix(path: &Path, length: u64) -> Result<String> {
-    let mut file = File::open(path)?;
+fn hash_exact_prefix_file(file: &File, length: u64) -> Result<String> {
+    let mut file = file.try_clone()?;
     let mut hasher = Sha256::new();
     hasher.update(b"token-ledger-source-v3");
     hasher.update(length.to_le_bytes());
     hash_file_range(&mut file, 0, length, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Open a discovered source without traversing a final-component symbolic
+/// link or Windows reparse point. The returned handle is the authority for
+/// metadata, fingerprinting, checkpoint validation, and parsing.
+fn open_source_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT makes the final component itself open;
+        // the attribute check below then rejects every reparse-point class.
+        options.custom_flags(0x0020_0000);
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source is a reparse point",
+            ));
+        }
+    }
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 fn hash_file_range(file: &mut File, start: u64, length: u64, hasher: &mut Sha256) -> Result<()> {
@@ -2128,6 +2242,109 @@ mod tests {
     }
 
     #[test]
+    fn compressed_line_limit_hard_stops_without_importing_a_prefix() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("oversized-line.jsonl.zst");
+        let valid_prefix = claude_record("valid-prefix", 1);
+        let max_line_bytes = valid_prefix.len() + 16;
+        let payload = format!("{valid_prefix}{}\n", "x".repeat(max_line_bytes + 1));
+        std::fs::write(&source, zstd::stream::encode_all(payload.as_bytes(), 0)?)?;
+        let adapters = static_adapters(source.clone(), true);
+        let mut ledger = Ledger::open(&dir.path().join("ledger.sqlite"))?;
+        let mut limits = DEFAULT_SCAN_LIMITS;
+        limits.compressed.max_line_bytes = max_line_bytes;
+
+        let first = scan_with_limits(
+            &mut ledger,
+            &Config::default(),
+            &adapters,
+            &ScanOptions::default(),
+            limits,
+        )?;
+        assert_eq!(first.scanned_sources, 1);
+        assert_eq!(first.observations, 0);
+        assert!(first.provisional);
+        assert!(ledger.canonical_events(None, None)?.is_empty());
+        let checkpoint = ledger
+            .source_checkpoint(&source)?
+            .context("compressed checkpoint missing")?;
+        assert_eq!(checkpoint.checkpoint_offset, 0);
+        assert_eq!(
+            checkpoint
+                .adapter_state
+                .get("compressed_archive_unsupported")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let repeated = scan_with_limits(
+            &mut ledger,
+            &Config::default(),
+            &adapters,
+            &ScanOptions::default(),
+            limits,
+        )?;
+        assert_eq!(repeated.scanned_sources, 0);
+        assert_eq!(repeated.observations, 0);
+        assert!(ledger.canonical_events(None, None)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn opened_handle_cannot_exceed_scheduled_work_reservation() -> Result<()> {
+        let dir = tempdir()?;
+        let source_path = dir.path().join("grew-after-scheduling.jsonl");
+        std::fs::write(&source_path, claude_record("small", 1))?;
+        let source = SourceSpec {
+            path: source_path.clone(),
+            client: Client::ClaudeCode,
+            compressed: false,
+        };
+        let limits = DEFAULT_SCAN_LIMITS;
+        let reserved = estimate_source_work(&source, limits)?;
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&source_path)?
+            .set_len(16 * 1024 * 1024)?;
+        let mut ledger = Ledger::open(&dir.path().join("ledger.sqlite"))?;
+        let adapter = StaticAdapter {
+            sources: vec![source.clone()],
+        };
+        let mut remaining_work = 0;
+        let mut work_reservation = SourceWorkReservation {
+            reserved_bytes: reserved,
+            remaining_bytes: &mut remaining_work,
+        };
+
+        match scan_one(
+            &mut ledger,
+            &adapter,
+            &source,
+            &ScanOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            None,
+            limits,
+            &mut work_reservation,
+        )? {
+            SourceOutcome::Limited(warning) => assert_eq!(warning.code, "scan_resource_limit"),
+            _ => anyhow::bail!("a grown source bypassed its work reservation"),
+        }
+        assert!(ledger.canonical_events(None, None)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn maximum_admitted_source_fits_aggregate_work_budget() -> Result<()> {
+        let limits = DEFAULT_SCAN_LIMITS;
+        let estimate = estimate_source_work_for_size(limits.max_source_file_bytes, true, limits);
+        assert!(estimate <= limits.max_total_work_bytes);
+        Ok(())
+    }
+
+    #[test]
     fn file_and_discovery_limits_are_reported_as_partial() -> Result<()> {
         let dir = tempdir()?;
         let first = dir.path().join("a.jsonl");
@@ -2690,6 +2907,87 @@ mod tests {
         assert!(!message.contains(TARGET_CANARY));
         assert!(!message.contains(LINK_CANARY));
         assert!(!message.contains(&outside_target.to_string_lossy().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn scanner_rejects_a_symlink_even_when_adapter_returns_it() -> Result<()> {
+        let dir = tempdir()?;
+        let outside = tempdir()?;
+        let target = outside.path().join("target.jsonl");
+        let link = dir.path().join("swapped.jsonl");
+        std::fs::write(&target, claude_record("must-not-import", 99))?;
+        if !try_create_test_file_symlink(&target, &link)? {
+            return Ok(());
+        }
+        let adapters = static_adapters(link.clone(), false);
+        let mut ledger = Ledger::open(&dir.path().join("ledger.sqlite"))?;
+
+        let summary = scan(
+            &mut ledger,
+            &Config::default(),
+            &adapters,
+            &ScanOptions::default(),
+        )?;
+        assert_eq!(summary.observations, 0);
+        assert!(summary.provisional);
+        assert!(ledger.canonical_events(None, None)?.is_empty());
+        let rejected = ledger
+            .source_checkpoint(&link)?
+            .context("rejected source warning should retain a bounded source reference")?;
+        assert_eq!(rejected.file_size, 0);
+        assert_eq!(rejected.checkpoint_offset, 0);
+        assert!(ledger.source_checkpoint(&target)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn scanner_rejects_regular_path_swapped_to_symlink_after_reservation() -> Result<()> {
+        let dir = tempdir()?;
+        let outside = tempdir()?;
+        let source_path = dir.path().join("scheduled.jsonl");
+        let target = outside.path().join("replacement.jsonl");
+        std::fs::write(&source_path, claude_record("scheduled", 1))?;
+        std::fs::write(&target, claude_record("must-not-import", 99))?;
+        let source = SourceSpec {
+            path: source_path.clone(),
+            client: Client::ClaudeCode,
+            compressed: false,
+        };
+        let limits = DEFAULT_SCAN_LIMITS;
+        let reserved = estimate_source_work(&source, limits)?;
+        std::fs::remove_file(&source_path)?;
+        if !try_create_test_file_symlink(&target, &source_path)? {
+            return Ok(());
+        }
+        let mut ledger = Ledger::open(&dir.path().join("ledger.sqlite"))?;
+        let adapter = StaticAdapter {
+            sources: vec![source.clone()],
+        };
+        let mut remaining_work = limits.max_total_work_bytes - reserved;
+        let mut work_reservation = SourceWorkReservation {
+            reserved_bytes: reserved,
+            remaining_bytes: &mut remaining_work,
+        };
+
+        assert!(
+            scan_one(
+                &mut ledger,
+                &adapter,
+                &source,
+                &ScanOptions {
+                    dry_run: true,
+                    ..Default::default()
+                },
+                None,
+                limits,
+                &mut work_reservation,
+            )
+            .is_err()
+        );
+        assert!(ledger.canonical_events(None, None)?.is_empty());
+        assert!(ledger.source_checkpoint(&source_path)?.is_none());
+        assert!(ledger.source_checkpoint(&target)?.is_none());
         Ok(())
     }
 
