@@ -48,7 +48,7 @@ The bundled catalog currently cites official OpenAI and Anthropic documentation.
 6. Update publication, verification, and staleness timestamps.
 7. Recompute the manifest SHA-256 over the exact catalog bytes.
 8. Run catalog validation, boundary, alias, dimension, and CLI lifecycle tests.
-9. Review `ledger prices diff`, `ledger prices verify`, and a representative historical cost report.
+9. Review `token-ledger prices diff`, `token-ledger prices verify`, and a representative historical cost report.
 
 Catalog installation is atomic. Replaced and installed revisions are retained for reproducible reports and explicit rollback.
 

@@ -19,6 +19,6 @@ Token Ledger welcomes respectful, technically rigorous participation.
 
 ## Enforcement
 
-Report conduct concerns privately using the process in `SECURITY.md`; do not include sensitive session material. Maintainers may edit or remove contributions, restrict participation, or take other proportionate action to protect contributors and users.
+During private staging, report conduct concerns through the private channel by which you received repository access. After public launch, if no private maintainer contact is available, open a minimal issue titled `Private conduct contact requested` without incident details; a maintainer will arrange private follow-up. Use GitHub's abuse-reporting tools for platform-policy violations. Do not use the vulnerability-reporting route unless the concern also presents a security issue, and never include sensitive session material. Maintainers may edit or remove contributions, restrict participation, or take other proportionate action to protect contributors and users.
 
 Enforcement decisions should be explained privately when practical and applied consistently.

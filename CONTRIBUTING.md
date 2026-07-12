@@ -35,17 +35,19 @@ cargo build --locked
 cargo test --all-targets --locked
 ```
 
-Run the full local quality gate:
+Run the full local quality gate on Windows or anywhere PowerShell is available:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/check.ps1
 ```
 
-or:
+The portable POSIX script runs the formatting, lint, test, and source-package-boundary subset:
 
 ```sh
 sh ./scripts/check.sh
 ```
+
+Release CI additionally runs the PowerShell private-content/dependency metadata audit and reproduces `THIRD-PARTY-NOTICES.html` with pinned `cargo-about` 0.9.1. Run those checks before publishing artifacts when PowerShell is available.
 
 ## Fixtures and privacy
 
@@ -86,4 +88,4 @@ Do not infer an unknown historical price, geography, authentication route, subsc
 
 Human terminal formatting may evolve between minor releases. The `--plain`, JSON, and CSV surfaces are compatibility-sensitive. A breaking machine-schema change requires a new schema identifier and migration notes.
 
-The canonical executable is currently named `ledger`. Renaming it is a user-facing breaking change and should be handled in a dedicated release.
+The canonical executable is `token-ledger`. Treat future executable renames as user-facing breaking changes that require a dedicated release.

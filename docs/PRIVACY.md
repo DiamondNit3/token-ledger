@@ -6,7 +6,7 @@ Token Ledger is designed to calculate local usage without building a second tran
 
 The scanner opens configured Claude Code and OpenAI Codex session files read-only. Those files may contain highly sensitive prompts, responses, code, tool calls, reasoning, paths, and terminal output. Parsers extract only accounting fields needed to identify and price usage.
 
-Provider reconciliation is an explicit offline import. Imported files may contain provider identifiers; the importer retains only canonical accounting buckets and content digests required for idempotence.
+Provider reconciliation is an explicit offline import. Imported files may contain provider identifiers; the importer retains only canonical accounting buckets and a domain-separated digest required for idempotence.
 
 ## What it stores
 
@@ -25,16 +25,20 @@ It is not intended to store prompts, responses, reasoning, code, tool bodies, te
 
 ## Pseudonymization is not anonymity
 
-Normal identifiers are deterministic so repeated scans can deduplicate events. They can therefore be linkable across reports and may be correlated by someone who possesses the source data. Treat the ledger and detailed exports as private accounting data.
+Stored event, session, message, request, import, and source identifiers are deterministic, domain-separated pseudonyms so repeated scans can deduplicate without retaining provider-native values. They can still be linkable across reports and may be correlated by someone who possesses the source data. Treat the ledger and detailed exports as private accounting data.
 
-`show_raw_ids = true` and equivalent raw-ID output are explicit privacy reductions intended only for local diagnosis.
+`show_raw_ids = true` shows complete stored pseudonyms instead of shortened display references. It cannot recover raw provider identifiers because those values are not retained.
+
+Opening a schema-v4 or schema-v5 ledger migrates it to schema v6. Both upgrade paths reapply every identifier storage boundary, reset resumable parser state, and use SQLite secure deletion, checked WAL truncation, and a post-migration vacuum so legacy identifier values are physically scrubbed on a best-effort basis. Cleanup remains durably marked as pending until those physical steps succeed, so an interrupted or busy cleanup is retried on the next open without transforming logical rows twice.
+
+Schema v6 retains a migration-only Codex identity bridge so copied/forked history continues to deduplicate after parser identity hardening. An alias contains an already-private canonical event key, a domain-separated session-scope digest, a sanitized line/byte locator, and an emitted-usage ordinal—never a provider ID, model, timestamp, or token signature. Migration creates at most three bounded scope candidates per legacy Codex observation; ordinary scans never add aliases, and replay state is capped at one row per source. Exact matches anchor copied sources, ambiguous or unanchored fallback candidates fail closed, and aliases cascade when their source is deleted or purged. Backups, snapshots, and storage history remain outside that boundary.
 
 ## Outputs
 
 - Human terminal output is pseudonymous by default.
 - JSON and CSV retain detailed accounting evidence and timestamps; review before sharing.
 - HTML reports are designed to omit prompts, paths, event/session/source IDs, and billing-evidence IDs, but should still be reviewed before distribution.
-- `--details` and `ledger explain` intentionally disclose more local accounting evidence.
+- `--details` and `token-ledger explain` intentionally disclose more local accounting evidence.
 
 Terminal color and progress never affect machine serializers. JSON, CSV, and HTML modes are ANSI-free.
 
@@ -46,7 +50,9 @@ No catalog update is installed solely because it arrived over HTTPS. Remote inst
 
 ## Deletion and retention
 
-`ledger purge --yes` removes Token Ledger's accounting rows, truncates its SQLite WAL, and vacuums the database on a best-effort basis. It never modifies Claude Code or Codex source sessions.
+Token Ledger retains the latest 256 completed scan diagnostics; older scan runs and their warning rows are pruned automatically. Health and coverage warning summaries describe only the latest scan, so a resolved warning does not remain a current alert. Canonical usage observations, source checkpoints, catalog history, reconciliation imports, and explicit billing evidence follow their functional retention rules rather than this diagnostic limit.
+
+`token-ledger purge --yes` removes Token Ledger's accounting rows, truncates its SQLite WAL, and vacuums the database on a best-effort basis. It never modifies Claude Code or Codex source sessions.
 
 Purge cannot erase external backups, filesystem snapshots, crash dumps, exported reports, or storage-device history. Delete those separately according to the operating environment.
 

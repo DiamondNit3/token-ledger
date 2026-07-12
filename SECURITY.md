@@ -8,7 +8,7 @@ Security fixes are made against the latest released minor version. Older local b
 
 Do not publish a report that contains session logs, prompts, source paths, account identifiers, database contents, configuration files, or credentials.
 
-Use the private security-reporting channel provided wherever this source is distributed. If no private channel is available, contact the maintainer privately before sharing reproduction material. Send the smallest synthetic reproduction possible.
+For the public project, use [GitHub private vulnerability reporting](https://github.com/DiamondNit3/token-ledger/security/advisories/new). GitHub makes this reporter-facing feature available only after the repository is public and a maintainer enables it. During private staging, disclose through the private channel by which you received access. Do not open a public issue for a suspected vulnerability. Send the smallest synthetic reproduction possible.
 
 A useful report includes:
 
@@ -38,7 +38,7 @@ Pseudonymous identifiers are deterministic accounting identifiers, not anonymous
 ## User responsibilities
 
 - Protect the ledger database and configuration with normal local filesystem permissions.
-- Treat JSON/CSV exports and `--raw-ids` output as potentially sensitive.
+- Treat JSON/CSV exports and full-pseudonym diagnostic output as potentially sensitive.
 - Obtain catalog checksums through a separately trusted channel.
 - Review HTML before sharing even though the exporter is designed to omit paths, source IDs, and transcript content.
 - Remember that purge cannot erase filesystem snapshots, backups, or storage-device history.

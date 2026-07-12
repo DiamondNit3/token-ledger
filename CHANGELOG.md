@@ -4,11 +4,42 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 ## Unreleased
 
-- Prepared a host-agnostic open-source source distribution.
-- Added contributor, security, privacy, architecture, pricing, support, and release documentation.
-- Declared and verified Rust 1.88 as the minimum supported Rust version.
-- Restricted Cargo source packaging to intentional source, assets, tests, documentation, and verification scripts.
-- Forbid unsafe Rust in the library and executable crates.
+No changes yet.
+
+## 0.4.0 - 2026-07-12
+
+### Added
+
+- Added `token-ledger demo`, a deterministic synthetic walkthrough that returns before loading configuration, a database, or session roots.
+- Added a reproducible 14.7-second terminal GIF generated from the real demo output.
+- Added native Windows x64, static Linux x64, macOS Intel, and macOS Apple Silicon release jobs with per-archive and consolidated SHA-256 checksums.
+- Added contributor, security, privacy, architecture, pricing, support, release, crates.io assessment, and public-maintenance documentation.
+
+### Changed
+
+- Made `token-ledger` the primary executable name.
+- Reduced the README opening to the outcome, three differentiators, installation, and a 30-second quick start.
+- Declared Rust 1.88 as the minimum supported version and pinned the locked source-package boundary.
+- Filled Cargo repository, homepage, and documentation metadata and configured GitHub private vulnerability reporting.
+
+### Fixed
+
+- Marked time-limited scans, discovery failures, unreadable or malformed records, incomplete tails, volatile sources, and resource-limited parsing as provisional instead of implying complete local history.
+- Strengthened append and rewrite validation so unchanged metadata alone cannot bypass checkpoint content checks.
+- Bounded source discovery, source and decompression reads, JSONL record size, records, observations, warnings, and total scan work.
+- Preserved useful discovery results at candidate, directory-entry, and I/O boundaries; completed candidate sets page across scans while unprovable traversal suffixes remain provisional.
+- Bounded retained scan diagnostics to the latest 256 completed runs, with older warning rows removed by cascade.
+- Preserved retryable checkpoints when parsing stops early and prevented partial sources from becoming successful coverage boundaries.
+- Scheduled unseen, deferred, and known sources in bounded rotating windows so unchanged prefixes cannot starve unvisited history.
+- Treated explicitly selected missing or invalid Claude roots as sanitized discovery failures instead of complete zero-source scans.
+- Preserved migrated Codex fork/copy event identity across partial replays, source-local rebuilds, and copies first discovered after migration; ambiguous or unanchored legacy matches now roll back rather than guess or double-count.
+
+### Security
+
+- Replaced persisted event, session, provider-message, provider-request, import, adapter-state, and source identifiers with deterministic domain-separated pseudonyms.
+- Added schema-v6 migrations that securely delete, checkpoint, and vacuum legacy identifier values on a best-effort basis while retaining only privacy-safe Codex rebuild aliases.
+- Redacted warning details at the SQLite storage boundary and pinned every GitHub Action to an immutable revision.
+- Restricted Cargo packages to intentional source, assets, tests, documentation, and verification scripts and continued to forbid unsafe Rust.
 
 ## 0.3.0 - 2026-07-11
 

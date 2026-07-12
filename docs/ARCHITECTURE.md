@@ -47,7 +47,7 @@ Client source files are inputs only. Token Ledger writes its own configuration, 
 2. Database provenance contains sanitized locators and parser metadata, not raw paths or records.
 3. Parser errors do not echo source fragments.
 4. Provider export identifiers are discarded.
-5. Normal identifiers are deterministic pseudonyms; raw IDs require explicit configuration.
+5. Stored identifiers are deterministic, domain-separated pseudonyms; configuration can reveal only their full stored form, never provider-native values.
 6. Share-safe HTML excludes paths and source, event, session, and billing-evidence identifiers.
 
 See [PRIVACY.md](PRIVACY.md) for limitations and user responsibilities.
