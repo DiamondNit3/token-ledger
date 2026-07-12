@@ -262,6 +262,7 @@ impl Ledger {
         // the same pseudonymization boundary.
         self.connection.pragma_update(None, "secure_delete", "ON")?;
         let mut needs_physical_cleanup = false;
+        let mut cleanup_follower = false;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Exclusive)?;
@@ -327,7 +328,10 @@ impl Ledger {
                     .optional()?;
                 match state.as_deref() {
                     Some(V7_PRIVACY_COMPLETE) => {}
-                    Some(V7_PRIVACY_PENDING) => needs_physical_cleanup = true,
+                    Some(V7_PRIVACY_PENDING) => {
+                        needs_physical_cleanup = true;
+                        cleanup_follower = true;
+                    }
                     _ => anyhow::bail!("database schema v7 is missing its privacy barrier marker"),
                 }
             }
@@ -341,6 +345,14 @@ impl Ledger {
         transaction.commit()?;
 
         if needs_physical_cleanup {
+            if cleanup_follower {
+                // The process that advanced the schema owns the first cleanup
+                // attempt. A follower that observed an already-pending barrier
+                // waits so two VACUUM/checkpoint loops do not contend in
+                // lockstep. If the owner crashed or failed, this process still
+                // takes over after the bounded grace period.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
             self.complete_v7_privacy_cleanup()?;
         }
         Ok(())
