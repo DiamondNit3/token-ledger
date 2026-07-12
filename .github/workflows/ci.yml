@@ -80,7 +80,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4 # 1.88.0
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # 1.88.0
 
       - name: Run tests on the minimum supported Rust version
         run: cargo test --all-targets --locked

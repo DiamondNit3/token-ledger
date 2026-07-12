@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust 1.88.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # master
         with:
           toolchain: 1.88.0
 
@@ -78,7 +78,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust 1.88.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # master
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.target }}
