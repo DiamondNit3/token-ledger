@@ -15,9 +15,9 @@ use clap::{
 };
 use serde::Serialize;
 
-use token_ledger::adapters::built_in_adapters;
 use token_ledger::adapters::claude::ClaudeAdapter;
 use token_ledger::adapters::codex::CodexAdapter;
+use token_ledger::adapters::{DiscoveryRequest, built_in_adapters};
 use token_ledger::config::Config;
 use token_ledger::cost::{
     CostBilling, CostPeriodSelection, CostQuery, CostReconciliation, build_cost_document,
@@ -56,11 +56,11 @@ const CLI_STYLES: ClapStyles = ClapStyles::styled()
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ledger",
+    name = "token-ledger",
     version,
     about = "Local-first Claude Code and OpenAI Codex token usage ledger",
     styles = CLI_STYLES,
-    after_help = "QUICK START:\n  ledger today\n  ledger cost --month\n  ledger doctor\n\nHuman output adapts to terminal width. JSON, CSV, and HTML schemas are unchanged."
+    after_help = "QUICK START:\n  token-ledger demo\n  token-ledger today\n  token-ledger cost --month\n\nHuman output adapts to terminal width. JSON, CSV, and HTML schemas are unchanged."
 )]
 struct Cli {
     /// Override the platform config file.
@@ -131,6 +131,8 @@ impl From<CliUnicodeChoice> for TerminalUnicodeChoice {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Preview Token Ledger with deterministic synthetic data; reads no local sessions or ledger.
+    Demo,
     /// Create configuration and initialize the database.
     Init(InitArgs),
     /// Inspect source discovery, coverage, and catalog health without exposing transcript content.
@@ -567,6 +569,12 @@ fn run() -> Result<()> {
     let Some(command) = command else {
         return emit_welcome();
     };
+    // Demo is intentionally handled before configuration resolution. It must
+    // remain safe when configuration, database, and source-root overrides are
+    // missing, malformed, or point at real user data.
+    if matches!(&command, Command::Demo) {
+        return command_demo();
+    }
     let (mut persisted_config, config_path) = Config::load(config_override.as_deref())?;
     let mut config = persisted_config.clone();
     if let Some(path) = db {
@@ -578,6 +586,7 @@ fn run() -> Result<()> {
     persisted_config.catalog_revision_override = catalog_revision;
 
     match command {
+        Command::Demo => unreachable!("demo returns before configuration is loaded"),
         Command::Init(args) => command_init(config, &config_path, args),
         Command::Doctor => command_doctor(&config),
         Command::Scan(args) => {
@@ -647,11 +656,19 @@ fn emit_welcome() -> Result<()> {
         terminal.paint(Tone::Muted, "Local Claude Code and OpenAI Codex accounting")
     );
     let _ = writeln!(text, "{}", terminal.paint(Tone::Strong, "QUICK START"));
-    let _ = writeln!(text, "  ledger today             Today's usage");
-    let _ = writeln!(text, "  ledger cost --month      Month-to-date estimate");
-    let _ = writeln!(text, "  ledger doctor            Check local coverage");
-    let _ = writeln!(text, "  ledger --help            Every command and option");
+    let _ = writeln!(
+        text,
+        "  token-ledger demo        Safe synthetic walkthrough"
+    );
+    let _ = writeln!(text, "  token-ledger today       Today's usage");
+    let _ = writeln!(text, "  token-ledger cost --month  Month-to-date estimate");
+    let _ = writeln!(text, "  token-ledger --help      Every command and option");
     terminal.emit_stdout(&text)?;
+    Ok(())
+}
+
+fn command_demo() -> Result<()> {
+    terminal_ui().emit_stdout(&token_ledger::demo::render_demo(terminal_ui())?)?;
     Ok(())
 }
 
@@ -681,12 +698,20 @@ fn command_is_machine(command: &Command) -> bool {
             ReconcileCommand::Report(args) => args.output.json,
         },
         Command::Export(_) => true,
-        Command::Init(_) | Command::Doctor | Command::Scan(_) | Command::Purge(_) => false,
+        Command::Demo
+        | Command::Init(_)
+        | Command::Doctor
+        | Command::Scan(_)
+        | Command::Purge(_) => false,
     }
 }
 
 fn command_init(mut config: Config, path: &Path, args: InitArgs) -> Result<()> {
-    if path.exists() && !args.force {
+    if path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config {}", path.display()))?
+        && !args.force
+    {
         anyhow::bail!(
             "config {} already exists; use --force to rewrite it",
             path.display()
@@ -718,14 +743,26 @@ fn command_doctor(config: &Config) -> Result<()> {
     let mut source_rows = Vec::new();
     let mut discovery_failed = false;
     for adapter in &adapters {
-        match adapter.discover(config) {
-            Ok(sources) => {
-                let compressed = sources.iter().filter(|source| source.compressed).count();
+        match adapter.discover_bounded(config, DiscoveryRequest::default()) {
+            Ok(discovery) => {
+                let limited = discovery.truncated();
+                discovery_failed |= limited;
+                let compressed = discovery
+                    .sources
+                    .iter()
+                    .filter(|source| source.compressed)
+                    .count();
                 source_rows.push(vec![
                     adapter.display_name().to_string(),
-                    "OK".to_string(),
-                    format_count(sources.len() as u64),
-                    if compressed > 0 {
+                    if limited { "WARN" } else { "OK" }.to_string(),
+                    if discovery.entry_limit_reached {
+                        format!("{}+", format_count(discovery.observed_source_count as u64))
+                    } else {
+                        format_count(discovery.observed_source_count as u64)
+                    },
+                    if limited {
+                        "Safe bounded partial discovery; not all entries were examined".to_string()
+                    } else if compressed > 0 {
                         format!("{compressed} compressed")
                     } else {
                         "Readable local files".to_string()
@@ -754,8 +791,12 @@ fn command_doctor(config: &Config) -> Result<()> {
         .map(|event| (event.client.as_str().to_string(), event.raw_model))
         .collect();
     let status = pricing.status();
+    let current_warning_count = coverage
+        .last_scan
+        .as_ref()
+        .map_or(0, |scan| scan.warning_count);
     let has_attention = discovery_failed
-        || stats.warnings > 0
+        || current_warning_count > 0
         || coverage.provisional
         || !unresolved_models.is_empty()
         || status.verification.error_count() > 0;
@@ -852,8 +893,16 @@ fn command_doctor(config: &Config) -> Result<()> {
         ],
         vec![
             "Warnings".to_string(),
-            if stats.warnings == 0 { "OK" } else { "REVIEW" }.to_string(),
-            format!("{} sanitized warning(s)", format_count(stats.warnings)),
+            if current_warning_count == 0 {
+                "OK"
+            } else {
+                "REVIEW"
+            }
+            .to_string(),
+            format!(
+                "{} sanitized warning(s) in the latest scan",
+                format_count(current_warning_count)
+            ),
         ],
     ];
     let _ = writeln!(output, "{}", terminal.paint(Tone::Accent, "LEDGER"));
@@ -2392,17 +2441,32 @@ fn print_scan_warnings(summary: &token_ledger::scanner::ScanSummary) -> Result<(
     if summary.warnings > 0 {
         let _ = writeln!(
             output,
-            "{} Scan recorded {} warning(s); run `ledger doctor` for sanitized codes.",
+            "{} Scan recorded {} warning(s); run `token-ledger doctor` for sanitized codes.",
             terminal.paint(Tone::Warning, terminal.status_symbol(Tone::Warning)),
             format_count(summary.warnings)
         );
     }
-    if summary.provisional {
+    if summary.active_or_volatile_source_count > 0 {
         let _ = writeln!(
             output,
-            "{} Snapshot is provisional because {} source(s) were active or volatile.",
+            "{} Snapshot is provisional: {} source(s) changed or remained volatile during scanning.",
             terminal.paint(Tone::Warning, terminal.status_symbol(Tone::Warning)),
             format_count(summary.active_or_volatile_source_count)
+        );
+    }
+    if summary.incomplete_source_count > 0 {
+        let _ = writeln!(
+            output,
+            "{} Snapshot is provisional: {} source(s) could not be exhaustively accounted or verified.",
+            terminal.paint(Tone::Warning, terminal.status_symbol(Tone::Warning)),
+            format_count(summary.incomplete_source_count)
+        );
+    }
+    if summary.coverage_limited {
+        let _ = writeln!(
+            output,
+            "{} Snapshot is provisional: discovery, aggregate work, or the requested time bound did not cover all local history.",
+            terminal.paint(Tone::Warning, terminal.status_symbol(Tone::Warning))
         );
     }
     if !output.is_empty() {
@@ -2905,7 +2969,7 @@ mod tests {
     #[test]
     fn rebuild_flag_keeps_full_alias_compatible() {
         for spelling in ["--rebuild", "--full"] {
-            let parsed = Cli::try_parse_from(["ledger", "scan", spelling]).unwrap();
+            let parsed = Cli::try_parse_from(["token-ledger", "scan", spelling]).unwrap();
             let Some(Command::Scan(args)) = parsed.command else {
                 panic!("expected scan command")
             };

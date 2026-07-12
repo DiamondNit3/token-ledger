@@ -188,7 +188,7 @@ pub struct CostMeasureEvidence {
     /// Number of event-level explanation entries considered by this aggregate.
     pub explanation_count: u64,
     /// Number of event-level entries compacted into categories or omitted by
-    /// the aggregate evidence limit. Use `ledger explain` for per-event math.
+    /// the aggregate evidence limit. Use `token-ledger explain` for per-event math.
     pub omitted_explanation_count: u64,
     pub explanations: Vec<String>,
 }

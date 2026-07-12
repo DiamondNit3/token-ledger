@@ -1,15 +1,20 @@
 [package]
 name = "token-ledger"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Local-first Claude Code and OpenAI Codex token usage ledger"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/DiamondNit3/token-ledger"
+homepage = "https://github.com/DiamondNit3/token-ledger"
+documentation = "https://docs.rs/token-ledger"
 keywords = ["cli", "tokens", "cost", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 include = [
+    "/about.hbs",
+    "/about.toml",
     "/assets/**",
     "/docs/**",
     "/scripts/**",
@@ -21,13 +26,16 @@ include = [
     "/Cargo.lock",
     "/Cargo.toml",
     "/LICENSE",
+    "/MUSL-1.2.3-COPYRIGHT.txt",
     "/README.md",
     "/SECURITY.md",
     "/SUPPORT.md",
+    "/THIRD-PARTY-NOTICES.html",
+    "/RUST-1.88-STANDARD-LIBRARY-NOTICES.html",
 ]
 
 [[bin]]
-name = "ledger"
+name = "token-ledger"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -7,13 +8,13 @@ use chrono::{DateTime, Utc};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use walkdir::WalkDir;
 
-use crate::adapters::SourceAdapter;
+use crate::adapters::{DiscoveryRequest, DiscoveryResult, SourceAdapter, discover_bounded_files};
 use crate::config::{Config, PathOrigin, ResolvedPath};
 use crate::model::{
     Client, CoverageStatus, DimensionValueProvenance, LineRecord, ParseBatch, PricingDimensions,
-    ScanWarning, SourceSpec, UsageObservation, UsageQuality, UsageVector, stable_id,
+    ScanWarning, SourceSpec, UsageObservation, UsageQuality, UsageVector, pseudonymous_session_id,
+    stable_id,
 };
 
 const PARSER_VERSION: &str = "codex-rollout-v1";
@@ -39,63 +40,78 @@ impl SourceAdapter for CodexAdapter {
         "OpenAI Codex"
     }
 
-    fn discover(&self, config: &Config) -> Result<Vec<SourceSpec>> {
+    fn discover_bounded(
+        &self,
+        config: &Config,
+        request: DiscoveryRequest,
+    ) -> Result<DiscoveryResult> {
         let (codex_home, explicit) = resolve_codex_home(config)?;
-        if !codex_home.exists() {
+        if !codex_home
+            .try_exists()
+            .context("failed to inspect CODEX_HOME")?
+        {
             if explicit {
                 bail!("configured CODEX_HOME does not exist");
             }
-            return Ok(Vec::new());
+            return Ok(DiscoveryResult::default());
         }
-        if !codex_home.is_dir() {
+        if !fs::metadata(&codex_home)
+            .context("failed to inspect CODEX_HOME metadata")?
+            .is_dir()
+        {
             bail!("configured CODEX_HOME is not a directory");
         }
 
         let codex_home = codex_home
             .canonicalize()
             .context("failed to canonicalize CODEX_HOME")?;
-        let mut sources = Vec::new();
+        let mut roots = Vec::new();
         for subdirectory in [ACTIVE_SESSIONS_DIR, ARCHIVED_SESSIONS_DIR] {
             let root = codex_home.join(subdirectory);
-            if !root.exists() {
+            if !root
+                .try_exists()
+                .with_context(|| format!("failed to inspect Codex {subdirectory} directory"))?
+            {
                 continue;
             }
-
-            for entry in WalkDir::new(&root).follow_links(false) {
-                let entry = entry.with_context(|| {
-                    format!("failed to inspect Codex {} directory", subdirectory)
-                })?;
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let path = entry.into_path();
-                let Some(compressed) = rollout_file_kind(&path) else {
-                    continue;
-                };
-
-                // Current Codex may temporarily have both representations while
-                // materializing an archived rollout. Prefer the plain file so one
-                // physical rollout is not scanned twice.
-                if compressed && plain_sibling(&path).is_some_and(|plain| plain.exists()) {
-                    continue;
-                }
-                sources.push(SourceSpec {
-                    path,
-                    client: Client::OpenaiCodex,
-                    compressed,
-                });
+            if !fs::metadata(&root)
+                .with_context(|| format!("failed to inspect Codex {subdirectory} metadata"))?
+                .is_dir()
+            {
+                bail!("Codex {subdirectory} path is not a directory");
             }
+            roots.push(root);
         }
 
-        // Rollout names begin with an ISO-like creation timestamp. Processing
-        // older files first makes the original provenance win before copied fork
-        // history, while event keys still provide the actual dedupe guarantee.
-        sources.sort_by(|left, right| {
+        let mut result = discover_bounded_files(&roots, request, |path| {
+            let Some(compressed) = rollout_file_kind(path) else {
+                return Ok(None);
+            };
+            // Current Codex may temporarily have both representations while
+            // materializing an archived rollout. Prefer the plain file so one
+            // physical rollout is not scanned twice.
+            if compressed
+                && let Some(plain) = plain_sibling(path)
+                && plain
+                    .try_exists()
+                    .with_context(|| "failed to inspect plain sibling for a Codex rollout")?
+            {
+                return Ok(None);
+            }
+            Ok(Some(SourceSpec {
+                path: path.to_path_buf(),
+                client: Client::OpenaiCodex,
+                compressed,
+            }))
+        })?;
+        // Rollout names begin with an ISO-like creation timestamp. Preserve a
+        // stable order inside the selected bounded candidate page.
+        result.sources.sort_by(|left, right| {
             rollout_sort_key(&left.path)
                 .cmp(&rollout_sort_key(&right.path))
                 .then_with(|| left.path.cmp(&right.path))
         });
-        Ok(sources)
+        Ok(result)
     }
 
     fn parse_lines(
@@ -118,9 +134,11 @@ impl SourceAdapter for CodexAdapter {
             },
             None => CodexState::default(),
         };
+        state.normalize_session_ids();
 
         if state.physical_thread_id.is_none() {
-            state.physical_thread_id = thread_id_from_rollout_name(path);
+            state.physical_thread_id = thread_id_from_rollout_name(path)
+                .map(|value| pseudonymous_session_id(Client::OpenaiCodex, &value));
         }
         if (state.auth_mode.is_none() || state.auth_mode_inferred)
             && let Some(auth_mode) = current_profile_auth_mode(path)
@@ -219,10 +237,12 @@ impl SourceAdapter for CodexAdapter {
             }
         }
 
+        let incomplete = !warnings.is_empty();
         Ok(ParseBatch {
             observations,
             warnings,
             next_state: serde_json::to_value(state)?,
+            incomplete,
         })
     }
 }
@@ -231,6 +251,9 @@ impl SourceAdapter for CodexAdapter {
 #[serde(default)]
 struct CodexState {
     canonical_meta_seen: bool,
+    /// True only for state produced by this parser or sanitized by the ledger.
+    /// Provider input never controls this state object.
+    session_ids_private: bool,
     logical_session_id: Option<String>,
     physical_thread_id: Option<String>,
     client_version: Option<String>,
@@ -241,8 +264,36 @@ struct CodexState {
     auth_mode_inferred: bool,
     context_window: Option<u64>,
     epoch: u64,
+    usage_event_index: u64,
     previous: Option<RawUsage>,
     warned: BTreeSet<String>,
+}
+
+impl CodexState {
+    fn normalize_session_ids(&mut self) {
+        let trusted = self.session_ids_private;
+        self.logical_session_id = self
+            .logical_session_id
+            .take()
+            .map(|value| normalize_state_session_id(&value, trusted));
+        self.physical_thread_id = self
+            .physical_thread_id
+            .take()
+            .map(|value| normalize_state_session_id(&value, trusted));
+        self.session_ids_private = true;
+    }
+}
+
+fn normalize_state_session_id(value: &str, trusted: bool) -> String {
+    let trusted_private = trusted
+        && value.strip_prefix("tlses_").is_some_and(|digest| {
+            digest.len() == 24 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if trusted_private {
+        value.to_ascii_lowercase()
+    } else {
+        pseudonymous_session_id(Client::OpenaiCodex, value)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,7 +556,8 @@ fn parse_session_meta(
         return;
     }
 
-    let record_thread_id = string_field(payload, &["id", "thread_id"]);
+    let record_thread_id = string_field(payload, &["id", "thread_id"])
+        .map(|value| pseudonymous_session_id(Client::OpenaiCodex, &value.to_ascii_lowercase()));
     if let (Some(expected), Some(found)) = (
         state.physical_thread_id.as_deref(),
         record_thread_id.as_deref(),
@@ -529,8 +581,12 @@ fn parse_session_meta(
         state.physical_thread_id = record_thread_id.clone();
     }
     state.logical_session_id = string_field(payload, &["session_id"])
+        .map(|value| pseudonymous_session_id(Client::OpenaiCodex, &value))
         .or(record_thread_id)
-        .or_else(|| thread_id_from_rollout_name(path));
+        .or_else(|| {
+            thread_id_from_rollout_name(path)
+                .map(|value| pseudonymous_session_id(Client::OpenaiCodex, &value))
+        });
     state.client_version = string_field(payload, &["cli_version"]);
     state.provider = string_field(payload, &["model_provider", "model_provider_id"]);
     if let Some(auth_mode) = string_field(payload, &["auth_mode"]) {
@@ -815,7 +871,7 @@ fn parse_token_count(
         .logical_session_id
         .clone()
         .or_else(|| state.physical_thread_id.clone())
-        .unwrap_or_else(|| rollout_sort_key(path));
+        .unwrap_or_else(|| pseudonymous_session_id(Client::OpenaiCodex, &rollout_sort_key(path)));
     if !state.canonical_meta_seen {
         warn_once(
             state,
@@ -917,6 +973,8 @@ fn parse_token_count(
     let epoch = proposed_epoch.to_string();
     let boundary = current.boundary();
     let event_key = stable_id(&["codex-counter-boundary", &session_id, &epoch, &boundary]);
+    state.usage_event_index = state.usage_event_index.saturating_add(1);
+    let usage_event_index = state.usage_event_index;
     let parser_version = match state.client_version.as_deref() {
         Some(version) => format!("{PARSER_VERSION};codex-cli={version}"),
         None => format!("{PARSER_VERSION};codex-cli=unknown"),
@@ -925,6 +983,7 @@ fn parse_token_count(
         event_key,
         client: Client::OpenaiCodex,
         session_id,
+        usage_event_index: Some(usage_event_index),
         provider_message_id: None,
         occurred_at,
         raw_model: model,
@@ -1260,7 +1319,10 @@ mod tests {
 
         assert_eq!(batch.observations.len(), 3);
         let first = &batch.observations[0];
-        assert_eq!(first.session_id, ROOT_SESSION);
+        assert_eq!(
+            first.session_id,
+            pseudonymous_session_id(Client::OpenaiCodex, ROOT_SESSION)
+        );
         assert_eq!(first.raw_model, "gpt-alpha");
         assert_eq!(first.provider, "openai");
         assert_eq!(first.dimensions.service_tier.as_deref(), Some("priority"));
@@ -1361,13 +1423,91 @@ mod tests {
                 Some(&first.next_state),
             )
             .expect("second batch");
+        let persisted_state = first.next_state.clone();
+        assert_eq!(
+            persisted_state
+                .get("session_ids_private")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!persisted_state.to_string().contains(ROOT_SESSION));
+        let resumed_from_private_state = CodexAdapter
+            .parse_lines(
+                &rollout_path(PARENT_THREAD),
+                &all[split..],
+                Some(&persisted_state),
+            )
+            .expect("second batch from persisted private state");
 
         assert_eq!(
             first.observations.len() + second.observations.len(),
             3,
             "repeat boundary must not be emitted across batches"
         );
+        assert_eq!(
+            second
+                .observations
+                .iter()
+                .map(|observation| &observation.event_key)
+                .collect::<Vec<_>>(),
+            resumed_from_private_state
+                .observations
+                .iter()
+                .map(|observation| &observation.event_key)
+                .collect::<Vec<_>>(),
+            "event identity must not change when persisted state pseudonymizes the session"
+        );
         assert_eq!(second.observations.last().unwrap().raw_model, "gpt-beta");
+    }
+
+    #[test]
+    fn crafted_session_pseudonym_lookalike_is_hashed_before_incremental_state() {
+        const LOOKALIKE: &str = "tlses_0123456789abcdef01234567";
+
+        let fixture = include_str!("fixtures/codex_basic.jsonl").replace(ROOT_SESSION, LOOKALIKE);
+        let all = records(&fixture, 1);
+        let split = 5;
+        let first = CodexAdapter
+            .parse_lines(&rollout_path(PARENT_THREAD), &all[..split], None)
+            .expect("fresh prefix-lookalike batch");
+        let second = CodexAdapter
+            .parse_lines(
+                &rollout_path(PARENT_THREAD),
+                &all[split..],
+                Some(&first.next_state),
+            )
+            .expect("incremental prefix-lookalike batch");
+        let complete = CodexAdapter
+            .parse_lines(&rollout_path(PARENT_THREAD), &all, None)
+            .expect("complete prefix-lookalike batch");
+
+        let private = pseudonymous_session_id(Client::OpenaiCodex, LOOKALIKE);
+        assert_ne!(private, LOOKALIKE);
+        assert_eq!(
+            first
+                .next_state
+                .get("logical_session_id")
+                .and_then(Value::as_str),
+            Some(private.as_str())
+        );
+        assert!(!first.next_state.to_string().contains(LOOKALIKE));
+        let incremental = first
+            .observations
+            .iter()
+            .chain(&second.observations)
+            .map(|observation| (&observation.event_key, &observation.session_id))
+            .collect::<Vec<_>>();
+        let complete = complete
+            .observations
+            .iter()
+            .map(|observation| (&observation.event_key, &observation.session_id))
+            .collect::<Vec<_>>();
+        assert_eq!(incremental, complete);
+        assert!(
+            incremental
+                .iter()
+                .all(|(_, session_id)| session_id.as_str() == private)
+        );
     }
 
     #[test]
@@ -1531,7 +1671,10 @@ mod tests {
             parent_batch.observations[0].event_key,
             child_batch.observations[0].event_key
         );
-        assert_eq!(child_batch.observations[0].session_id, ROOT_SESSION);
+        assert_eq!(
+            child_batch.observations[0].session_id,
+            pseudonymous_session_id(Client::OpenaiCodex, ROOT_SESSION)
+        );
         assert_eq!(
             parent_batch.observations[0].occurred_at,
             "2026-07-09T10:00:02Z".parse::<DateTime<Utc>>().unwrap()
@@ -1637,5 +1780,17 @@ mod tests {
                 .iter()
                 .any(|source| source.path == duplicate_compressed)
         );
+    }
+
+    #[test]
+    fn non_directory_session_root_is_a_discovery_error() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join(ACTIVE_SESSIONS_DIR), "not a directory").unwrap();
+        let config = Config {
+            codex_home: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        assert!(CodexAdapter.discover(&config).is_err());
     }
 }

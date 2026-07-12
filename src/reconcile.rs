@@ -1414,6 +1414,7 @@ mod tests {
             event_key: format!("event-{occurred_at}-{model}"),
             client,
             session_id: "private-local-session".to_string(),
+            usage_event_index: None,
             provider_message_id: None,
             occurred_at: DateTime::parse_from_rfc3339(occurred_at)?.with_timezone(&Utc),
             raw_model: model.to_string(),

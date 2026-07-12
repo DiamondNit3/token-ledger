@@ -112,6 +112,8 @@ pub struct Config {
     /// separate from API-equivalent pricing estimates.
     #[serde(default)]
     pub billing_evidence: BillingEvidence,
+    /// Show full stored pseudonyms instead of shortened display references.
+    /// Provider-native identifiers are never retained in the ledger.
     pub show_raw_ids: bool,
     /// Transient command-line overrides; deliberately never persisted.
     #[serde(skip)]
@@ -164,7 +166,10 @@ impl Config {
         let path = path
             .map(Path::to_path_buf)
             .unwrap_or(Self::default_config_path()?);
-        if !path.exists() {
+        if !path
+            .try_exists()
+            .with_context(|| format!("failed to inspect config {}", path.display()))?
+        {
             return Ok((Self::default(), path));
         }
         let raw = fs::read_to_string(&path)

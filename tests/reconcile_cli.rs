@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -38,7 +39,7 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("ledger").expect("compiled ledger");
+        let mut command = Command::cargo_bin("token-ledger").expect("compiled token-ledger");
         command.arg("--config").arg(&self.config);
         command
     }
@@ -67,6 +68,9 @@ fn reconcile_import_status_and_report_are_idempotent_and_separate() {
     let fixture = Fixture::new();
     let native = fixture_path("openai_organization_usage.json");
     let native_text = native.to_string_lossy().to_string();
+    let raw_digest = hex::encode(Sha256::digest(
+        fs::read(&native).expect("read native reconciliation fixture"),
+    ));
 
     let first = fixture.json(&[
         "reconcile",
@@ -78,6 +82,7 @@ fn reconcile_import_status_and_report_are_idempotent_and_separate() {
     ]);
     assert_eq!(first["imported"], true);
     assert_eq!(first["bucket_count"], 1);
+    assert_ne!(first["content_digest"], raw_digest);
     let serialized = serde_json::to_string(&first).expect("serialize receipt");
     assert!(!serialized.contains("project-private-canary"));
     assert!(!serialized.contains("key-private-canary"));
@@ -97,6 +102,7 @@ fn reconcile_import_status_and_report_are_idempotent_and_separate() {
     assert_eq!(status["import_count"], 1);
     assert_eq!(status["bucket_count"], 1);
     assert_eq!(status["providers"][0], "openai");
+    assert_ne!(status["latest_imports"][0]["content_digest"], raw_digest);
 
     let report = fixture.json(&["reconcile", "report", "--no-scan", "--json"]);
     assert_eq!(

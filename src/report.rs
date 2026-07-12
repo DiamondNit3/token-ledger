@@ -183,7 +183,7 @@ pub struct ReportRow {
     pub client: Option<String>,
     pub model: Option<String>,
     pub requests: u64,
-    /// Canonical event IDs for `ledger explain --event <ID>`.
+    /// Canonical event IDs for `token-ledger explain --event <ID>`.
     pub event_ids: Vec<String>,
     pub sessions: u64,
     pub input_tokens_total: u64,
@@ -410,14 +410,14 @@ pub fn aggregate(
             EstimateStatus::Partial => {
                 aggregate.partial_events += 1;
                 aggregate.warnings.insert(
-                    "one or more events have partial price coverage; use `ledger explain` for event-level missing components"
+                    "one or more events have partial price coverage; use `token-ledger explain` for event-level missing components"
                         .to_string(),
                 );
             }
             EstimateStatus::Unpriced => {
                 aggregate.unpriced_events += 1;
                 aggregate.warnings.insert(
-                    "one or more events are unpriced; use `ledger explain` for event-level rate matching details"
+                    "one or more events are unpriced; use `token-ledger explain` for event-level rate matching details"
                         .to_string(),
                 );
             }
@@ -814,7 +814,7 @@ pub fn render_report_with_options(document: &ReportDocument, terminal: &Terminal
     if document.catalog.freshness != CatalogFreshness::Fresh {
         let _ = writeln!(
             output,
-            "{} Price catalog is {}; inspect `ledger prices status` before relying on estimates.",
+            "{} Price catalog is {}; inspect `token-ledger prices status` before relying on estimates.",
             terminal.paint(Tone::Warning, terminal.status_symbol(Tone::Warning)),
             catalog_freshness_label(document.catalog.freshness)
         );
@@ -825,7 +825,7 @@ pub fn render_report_with_options(document: &ReportDocument, terminal: &Terminal
         if !document.rows.is_empty() {
             let _ = writeln!(
                 output,
-                "Each row has a privacy-safe event reference for `ledger explain --event <ID>`."
+                "Each row has a privacy-safe event reference for `token-ledger explain --event <ID>`."
             );
         }
     } else if !terminal.plain {
@@ -1050,7 +1050,7 @@ fn render_report_row_details(row: &ReportRow, terminal: &TerminalOptions, output
         row.quality
     );
     if let Some(event_id) = row.event_ids.first() {
-        let _ = writeln!(output, "  Inspect: ledger explain --event {event_id}");
+        let _ = writeln!(output, "  Inspect: token-ledger explain --event {event_id}");
     }
 }
 

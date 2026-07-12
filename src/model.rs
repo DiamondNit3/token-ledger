@@ -218,6 +218,11 @@ pub struct UsageObservation {
     pub event_key: String,
     pub client: Client,
     pub session_id: String,
+    /// Source-local ordinal assigned when Codex emits a billable usage
+    /// boundary. It is migration bridge metadata, not provider identity, and
+    /// is never persisted as an accounting dimension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_event_index: Option<u64>,
     pub provider_message_id: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub raw_model: String,
@@ -320,11 +325,12 @@ pub struct ScanRunSnapshot {
     pub source_count: u64,
     pub observation_count: u64,
     pub warning_count: u64,
-    /// Sources that changed while they were parsed or between their parse and
-    /// the final revalidation pass.
+    /// Sources that changed while scanned or remained volatile through bounded
+    /// stability retries. Coverage limits and incomplete sources are reflected
+    /// separately by `status`, warnings, and `provisional`.
     pub active_or_volatile_source_count: u64,
-    /// True when the snapshot may move because a source was active/volatile,
-    /// or when the scan did not complete successfully.
+    /// True when the snapshot may move because coverage was limited, a source
+    /// was active/incomplete, or the scan did not complete successfully.
     pub provisional: bool,
 }
 
@@ -423,6 +429,10 @@ pub struct ParseBatch {
     pub observations: Vec<UsageObservation>,
     pub warnings: Vec<ScanWarning>,
     pub next_state: Value,
+    /// True when one or more source records could not be interpreted. The
+    /// scanner may retain known observations, but must not describe the source
+    /// or enclosing scan as complete.
+    pub incomplete: bool,
 }
 
 pub fn stable_id(parts: &[&str]) -> String {
@@ -437,6 +447,38 @@ pub fn stable_id(parts: &[&str]) -> String {
     format!("evt_{}", &hex::encode(digest)[..24])
 }
 
+/// Builds a deterministic, domain-separated pseudonym for private identifiers.
+///
+/// The domain is part of the digest input rather than only the display prefix,
+/// so the same provider value cannot be correlated across sessions, messages,
+/// requests, adapter state, and other storage purposes. The original value is
+/// intentionally unrecoverable from the returned identifier.
+pub fn pseudonymous_id(prefix: &str, domain: &str, parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"token-ledger/private-pseudonym/v1\0");
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("{prefix}_{}", &digest[..24])
+}
+
+/// Pseudonymizes one untrusted, source-observed session identifier.
+///
+/// This deliberately hashes every input, including strings that already look
+/// like Token Ledger pseudonyms. Syntax alone is not a trust boundary: a
+/// provider-native identifier can use the same prefix and shape. Callers that
+/// resume internally generated parser state must track that provenance
+/// separately instead of relying on prefix detection.
+pub fn pseudonymous_session_id(client: Client, value: &str) -> String {
+    pseudonymous_id("tlses", "persisted-session", &[client.as_str(), value])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +487,40 @@ mod tests {
     fn stable_ids_are_deterministic_and_delimited() {
         assert_eq!(stable_id(&["ab", "c"]), stable_id(&["ab", "c"]));
         assert_ne!(stable_id(&["ab", "c"]), stable_id(&["a", "bc"]));
+    }
+
+    #[test]
+    fn private_pseudonyms_are_deterministic_delimited_and_domain_separated() {
+        let session = pseudonymous_id("tlses", "session", &["claude", "same-raw-id"]);
+        assert_eq!(
+            session,
+            pseudonymous_id("tlses", "session", &["claude", "same-raw-id"])
+        );
+        assert_ne!(
+            session,
+            pseudonymous_id("tlmsg", "provider-message", &["claude", "same-raw-id"])
+        );
+        assert_ne!(
+            pseudonymous_id("tlses", "session", &["ab", "c"]),
+            pseudonymous_id("tlses", "session", &["a", "bc"])
+        );
+        assert!(session.starts_with("tlses_"));
+        assert_eq!(session.len(), 30);
+    }
+
+    #[test]
+    fn raw_session_pseudonymization_never_trusts_prefix_shape() {
+        let first = pseudonymous_session_id(Client::OpenaiCodex, "raw-session");
+        assert_ne!(pseudonymous_session_id(Client::OpenaiCodex, &first), first);
+        let crafted_lookalike = "tlses_0123456789abcdef01234567";
+        assert_ne!(
+            pseudonymous_session_id(Client::OpenaiCodex, crafted_lookalike),
+            crafted_lookalike
+        );
+        assert_ne!(
+            pseudonymous_session_id(Client::ClaudeCode, "raw-session"),
+            first
+        );
     }
 
     #[test]

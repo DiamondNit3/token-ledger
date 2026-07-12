@@ -3,14 +3,13 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use directories::BaseDirs;
 use serde::Deserialize;
 use serde_json::Value;
-use walkdir::WalkDir;
 
-use crate::adapters::SourceAdapter;
+use crate::adapters::{DiscoveryRequest, DiscoveryResult, SourceAdapter, discover_bounded_files};
 use crate::config::{Config, PathOrigin, ResolvedPath};
 use crate::model::{
     Client, CoverageStatus, DimensionValueProvenance, LineRecord, ParseBatch, PricingDimensions,
@@ -74,15 +73,50 @@ impl SourceAdapter for ClaudeAdapter {
         "Claude Code"
     }
 
-    fn discover(&self, config: &Config) -> Result<Vec<SourceSpec>> {
-        let projects_root = Self::resolve_root(config)?.join("projects");
-        if !projects_root.exists() {
-            return Ok(Vec::new());
+    fn discover_bounded(
+        &self,
+        config: &Config,
+        request: DiscoveryRequest,
+    ) -> Result<DiscoveryResult> {
+        let resolved_root = Self::resolve_root_with_origin(config)?;
+        let root_exists = resolved_root.path.try_exists().with_context(|| {
+            format!(
+                "failed to inspect Claude Code root {}",
+                resolved_root.path.display()
+            )
+        })?;
+        if !root_exists {
+            if resolved_root.origin == PathOrigin::Default {
+                // A machine that has never used Claude Code normally has no
+                // platform-default root; that is not a discovery failure.
+                return Ok(DiscoveryResult::default());
+            }
+            bail!("selected Claude Code root does not exist");
+        }
+        if !fs::metadata(&resolved_root.path)
+            .with_context(|| {
+                format!(
+                    "failed to inspect Claude Code root metadata {}",
+                    resolved_root.path.display()
+                )
+            })?
+            .is_dir()
+        {
+            bail!("selected Claude Code root is not a directory");
         }
 
-        // Validate the top-level directory separately. WalkDir errors below this
-        // point are skipped so one unreadable project does not hide other readable
-        // sessions; the scanner's source-level diagnostics handle files it receives.
+        let projects_root = resolved_root.path.join("projects");
+        if !projects_root.try_exists().with_context(|| {
+            format!(
+                "failed to inspect Claude Code projects directory {}",
+                projects_root.display()
+            )
+        })? {
+            return Ok(DiscoveryResult::default());
+        }
+
+        // Validate the top-level directory separately so a missing default is
+        // distinct from a configured root that cannot be enumerated.
         fs::read_dir(&projects_root).with_context(|| {
             format!(
                 "failed to read Claude Code projects directory {}",
@@ -90,29 +124,20 @@ impl SourceAdapter for ClaudeAdapter {
             )
         })?;
 
-        let mut sources = WalkDir::new(&projects_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-            })
-            .map(|entry| SourceSpec {
-                path: entry.into_path(),
+        discover_bounded_files(&[projects_root], request, |path| {
+            if !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+            {
+                return Ok(None);
+            }
+            Ok(Some(SourceSpec {
+                path: path.to_path_buf(),
                 client: Client::ClaudeCode,
                 compressed: false,
-            })
-            .collect::<Vec<_>>();
-
-        // Stable discovery order makes cold rebuilds and fixture snapshots
-        // reproducible across filesystems.
-        sources.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(sources)
+            }))
+        })
     }
 
     fn parse_lines(
@@ -194,6 +219,9 @@ impl SourceAdapter for ClaudeAdapter {
                 .cmp(&right.occurred_at)
                 .then_with(|| left.event_key.cmp(&right.event_key))
         });
+        // Claude scan warnings are emitted only when a candidate usage record
+        // was malformed or lacked fields required to account for it.
+        batch.incomplete = !batch.warnings.is_empty();
         Ok(batch)
     }
 }
@@ -410,6 +438,7 @@ fn candidate_from_envelope(
             event_key,
             client: Client::ClaudeCode,
             session_id,
+            usage_event_index: None,
             provider_message_id,
             occurred_at,
             raw_model,
@@ -748,6 +777,31 @@ mod tests {
                 .iter()
                 .any(|source| source.path.ends_with("agent-one.jsonl"))
         );
+    }
+
+    #[test]
+    fn non_directory_projects_root_is_a_discovery_error() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join(".claude");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("projects"), "not a directory").unwrap();
+        let config = Config {
+            claude_root: Some(root),
+            ..Config::default()
+        };
+
+        assert!(ClaudeAdapter.discover(&config).is_err());
+    }
+
+    #[test]
+    fn explicit_missing_root_is_a_discovery_error() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            claude_root_override: Some(temp.path().join("missing-claude-root")),
+            ..Config::default()
+        };
+
+        assert!(ClaudeAdapter.discover(&config).is_err());
     }
 
     #[test]

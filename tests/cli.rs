@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const PRIVACY_CANARY: &str = "TOKEN_LEDGER_PRIVACY_CANARY_91C81F4D";
+const LOOKALIKE_SESSION: &str = "tlses_0123456789abcdef01234567";
+const LOOKALIKE_MESSAGE: &str = "tlmsg_0123456789abcdef01234567";
+const LOOKALIKE_REQUEST: &str = "tlreq_0123456789abcdef01234567";
 
 struct CliFixture {
     _temp: TempDir,
@@ -50,7 +53,7 @@ impl CliFixture {
     }
 
     fn binary(&self) -> Command {
-        let mut command = Command::cargo_bin("ledger").expect("compiled ledger binary");
+        let mut command = Command::cargo_bin("token-ledger").expect("compiled token-ledger binary");
         command.arg("--config").arg(&self.config);
         command
     }
@@ -410,6 +413,501 @@ fn scans_both_clients_idempotently_and_exposes_private_safe_reports() {
 }
 
 #[test]
+fn persisted_identifiers_remain_private_even_when_raw_display_is_requested() {
+    let fixture = CliFixture::create();
+    fixture.initialize();
+    fixture.run(&["scan"]);
+
+    let raw = fs::read_to_string(&fixture.config).expect("read generated config");
+    let mut config: toml::Value = toml::from_str(&raw).expect("parse generated config");
+    config
+        .as_table_mut()
+        .expect("generated config is a table")
+        .insert("show_raw_ids".to_owned(), toml::Value::Boolean(true));
+    fs::write(
+        &fixture.config,
+        toml::to_string_pretty(&config).expect("serialize raw-id config"),
+    )
+    .expect("write raw-id config");
+
+    let sessions = fixture.run(&[
+        "sessions",
+        "--date",
+        "2026-07-10",
+        "--tz",
+        "America/New_York",
+        "--no-scan",
+        "--json",
+    ]);
+    let day = fixture.run(&[
+        "day",
+        "2026-07-10",
+        "--tz",
+        "America/New_York",
+        "--no-scan",
+        "--json",
+    ]);
+    let document = json_value(&day);
+    let event_ids = document["rows"]
+        .as_array()
+        .expect("report rows")
+        .iter()
+        .flat_map(|row| row["event_ids"].as_array().into_iter().flatten())
+        .filter_map(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert!(!event_ids.is_empty());
+
+    let mut output = output_text(&sessions.stdout);
+    output.push_str(&output_text(&day.stdout));
+    for event_id in event_ids {
+        let explain = fixture.run(&["explain", "--event", &event_id, "--json"]);
+        output.push_str(&output_text(&explain.stdout));
+    }
+    for raw_identifier in [
+        "claude-session-known",
+        "claude-request-known",
+        "msg-claude-known",
+        "codex-session-known",
+        "11111111-1111-7111-8111-111111111111",
+    ] {
+        assert!(
+            !output.contains(raw_identifier),
+            "persisted raw identifier leaked despite the storage boundary: {raw_identifier}"
+        );
+    }
+    assert!(output.contains("tlses_") || output.contains("evt_"));
+}
+
+#[test]
+fn pseudonym_shaped_provider_ids_are_transformed_in_db_and_cli_output() {
+    let fixture = CliFixture::create();
+    fixture.initialize();
+    let source = fixture
+        .claude_root
+        .join("projects")
+        .join("lookalike-project")
+        .join("lookalike.jsonl");
+    fs::create_dir_all(source.parent().expect("lookalike source parent"))
+        .expect("create lookalike source parent");
+    let record = serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2026-07-10T16:00:00Z",
+        "sessionId": LOOKALIKE_SESSION,
+        "requestId": LOOKALIKE_REQUEST,
+        "message": {
+            "id": LOOKALIKE_MESSAGE,
+            "model": "claude-sonnet-4-6",
+            "usage": {
+                "input_tokens": 11,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 2
+            }
+        }
+    });
+    fs::write(&source, format!("{record}\n")).expect("write lookalike source");
+    fixture.run(&["scan"]);
+
+    let raw = fs::read_to_string(&fixture.config).expect("read generated config");
+    let mut config: toml::Value = toml::from_str(&raw).expect("parse generated config");
+    config
+        .as_table_mut()
+        .expect("generated config is a table")
+        .insert("show_raw_ids".to_owned(), toml::Value::Boolean(true));
+    fs::write(
+        &fixture.config,
+        toml::to_string_pretty(&config).expect("serialize raw-id config"),
+    )
+    .expect("write raw-id config");
+
+    let sessions = fixture.run(&[
+        "sessions",
+        "--date",
+        "2026-07-10",
+        "--tz",
+        "America/New_York",
+        "--no-scan",
+        "--json",
+    ]);
+    let day = fixture.run(&[
+        "day",
+        "2026-07-10",
+        "--tz",
+        "America/New_York",
+        "--no-scan",
+        "--json",
+    ]);
+    let event_id = stable_event_id("claude_code", &format!("message:{LOOKALIKE_MESSAGE}"));
+    let explain = fixture.run(&["explain", "--event", &event_id, "--json"]);
+    let mut rendered = output_text(&sessions.stdout);
+    rendered.push_str(&output_text(&day.stdout));
+    rendered.push_str(&output_text(&explain.stdout));
+    rendered.push_str(&output_text(&sessions.stderr));
+    rendered.push_str(&output_text(&day.stderr));
+    rendered.push_str(&output_text(&explain.stderr));
+    for raw_identifier in [LOOKALIKE_SESSION, LOOKALIKE_MESSAGE, LOOKALIKE_REQUEST] {
+        assert!(
+            !rendered.contains(raw_identifier),
+            "pseudonym-shaped provider identifier leaked to CLI output: {raw_identifier}"
+        );
+    }
+
+    let connection = Connection::open(&fixture.database).expect("open test ledger");
+    let stored: (String, String, String) = connection
+        .query_row(
+            r#"SELECT session_id, provider_message_id, dimensions_json
+               FROM usage_observations
+               WHERE occurred_at_utc LIKE '2026-07-10T16:00:00%'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read lookalike observation");
+    assert_ne!(stored.0, LOOKALIKE_SESSION);
+    assert_ne!(stored.1, LOOKALIKE_MESSAGE);
+    let dimensions: JsonValue =
+        serde_json::from_str(&stored.2).expect("parse stored pricing dimensions");
+    assert_ne!(
+        dimensions["provider_request_id"].as_str(),
+        Some(LOOKALIKE_REQUEST)
+    );
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint lookalike ledger");
+    drop(connection);
+    assert_database_excludes(
+        &fixture.database,
+        &[LOOKALIKE_SESSION, LOOKALIKE_MESSAGE, LOOKALIKE_REQUEST],
+    );
+}
+
+#[test]
+fn codex_session_identity_survives_persisted_incremental_state() {
+    let fixture = CliFixture::create();
+    fixture.initialize();
+    fixture.run(&["scan"]);
+    let rollout = fixture
+        .codex_home
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("10")
+        .join("rollout-2026-07-10T14-00-00-11111111-1111-7111-8111-111111111111.jsonl");
+    let mut content = fs::read_to_string(&rollout).expect("read Codex rollout");
+    content.push_str(concat!(
+        "{\"timestamp\":\"2026-07-10T14:00:07Z\",\"type\":\"event_msg\",",
+        "\"payload\":{\"type\":\"token_count\",\"info\":{",
+        "\"total_token_usage\":{\"input_tokens\":250,\"cached_input_tokens\":60,",
+        "\"cache_write_tokens\":0,\"output_tokens\":25,\"reasoning_output_tokens\":10,",
+        "\"total_tokens\":275},\"last_token_usage\":{\"input_tokens\":50,",
+        "\"cached_input_tokens\":10,\"cache_write_tokens\":0,\"output_tokens\":5,",
+        "\"reasoning_output_tokens\":2,\"total_tokens\":55},",
+        "\"model_context_window\":200000}}}\n"
+    ));
+    fs::write(&rollout, content).expect("append Codex usage boundary");
+    fixture.run(&["scan"]);
+
+    let connection = Connection::open(&fixture.database).expect("open test ledger");
+    let (sessions, events): (i64, i64) = connection
+        .query_row(
+            r#"SELECT COUNT(DISTINCT session_id), COUNT(DISTINCT event_key)
+               FROM usage_observations WHERE client='openai_codex'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read incremental Codex identities");
+    assert_eq!(
+        sessions, 1,
+        "persisted state changed Codex session identity"
+    );
+    assert_eq!(events, 2, "new cumulative boundary was not retained once");
+    let state: String = connection
+        .query_row(
+            r#"SELECT adapter_state FROM source_files WHERE client='openai_codex'"#,
+            [],
+            |row| row.get(0),
+        )
+        .expect("read persisted Codex state");
+    let state: JsonValue = serde_json::from_str(&state).expect("parse persisted Codex state");
+    assert_eq!(state["session_ids_private"], true);
+    assert!(!state.to_string().contains("codex-session-known"));
+}
+
+#[test]
+fn migrated_codex_fork_identity_survives_single_source_rebuild() {
+    const RAW_SESSION: &str = "codex-session-known";
+    const PARENT_THREAD: &str = "11111111-1111-7111-8111-111111111111";
+    const CHILD_THREAD: &str = "22222222-2222-7222-8222-222222222222";
+    const BOUNDARY: &str = "i=200;ci=50;o=20;ro=8;t=220;w5=0;w1=0;wu=0";
+
+    let fixture = CliFixture::create();
+    fixture.initialize();
+    let parent = fixture
+        .codex_home
+        .join("sessions/2026/07/10")
+        .join(format!("rollout-2026-07-10T14-00-00-{PARENT_THREAD}.jsonl"));
+    let child = fixture
+        .codex_home
+        .join("sessions/2026/07/10")
+        .join(format!("rollout-2026-07-10T14-00-00-{CHILD_THREAD}.jsonl"));
+    let child_content = fs::read_to_string(&parent)
+        .expect("read parent Codex rollout")
+        .replace(PARENT_THREAD, CHILD_THREAD);
+    fs::write(&child, child_content).expect("write copied child Codex rollout");
+    fixture.run(&["scan"]);
+
+    let legacy_event_key = stable_id_parts(&["codex-counter-boundary", RAW_SESSION, "0", BOUNDARY]);
+    let legacy_state = serde_json::json!({
+        "canonical_meta_seen": true,
+        "logical_session_id": RAW_SESSION,
+        "physical_thread_id": PARENT_THREAD,
+        "client_version": "0.144.0",
+        "model": "gpt-5.4",
+        "provider": "openai",
+        "epoch": 0,
+        "previous": {
+            "input": 200,
+            "cached_input": 50,
+            "output": 20,
+            "reasoning_output": 8,
+            "total": 220,
+            "cache_write_5m": 0,
+            "cache_write_1h": 0,
+            "cache_write_unknown": 0,
+            "cached_input_reported": true,
+            "reasoning_output_reported": true,
+            "cache_write_reported": true
+        }
+    });
+    {
+        let connection = Connection::open(&fixture.database).expect("open pre-migration ledger");
+        connection
+            .execute(
+                r#"UPDATE usage_observations
+                   SET event_key=?1, session_id=?2
+                   WHERE client='openai_codex'"#,
+                rusqlite::params![legacy_event_key, RAW_SESSION],
+            )
+            .expect("restore v4 Codex observation identity");
+        connection
+            .execute(
+                r#"UPDATE source_files SET adapter_state=?1
+                   WHERE client='openai_codex'"#,
+                [legacy_state.to_string()],
+            )
+            .expect("restore v4 Codex parser state");
+        connection
+            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
+            .expect("mark ledger schema v4");
+    }
+    fs::remove_file(&child).expect("remove copied source before source-local rebuild");
+
+    fixture.run(&["scan", "--client", "codex", "--rebuild"]);
+    let connection = Connection::open(&fixture.database).expect("open migrated ledger");
+    let (schema, observations, canonical_events, aliases): (i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'),
+                   (SELECT COUNT(*) FROM usage_observations WHERE client='openai_codex'),
+                   (SELECT COUNT(*) FROM (
+                       SELECT event_key FROM usage_observations
+                       WHERE client='openai_codex' GROUP BY event_key
+                   )),
+                   (SELECT COUNT(*) FROM codex_event_identity_aliases)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read migrated fork identity counts");
+    assert_eq!(schema, 6);
+    assert_eq!(observations, 2);
+    assert_eq!(canonical_events, 1, "copied boundary was double-counted");
+    assert_eq!(
+        aliases, 6,
+        "each migrated observation has exactly three bounded private scope candidates"
+    );
+    let alias_rows = {
+        let mut statement = connection
+            .prepare(
+                r#"SELECT canonical_event_key, source_locator, session_scope,
+                          usage_event_index
+                   FROM codex_event_identity_aliases"#,
+            )
+            .expect("prepare alias privacy query");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query alias privacy rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect alias privacy rows")
+    };
+    assert!(alias_rows.iter().all(|(event, locator, scope, ordinal)| {
+        event.starts_with("evt_")
+            && locator.starts_with("line ")
+            && scope.starts_with("tlasp_")
+            && *ordinal > 0
+            && !locator.contains(RAW_SESSION)
+    }));
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint migrated fork ledger");
+    drop(connection);
+
+    let report = fixture.run(&[
+        "day",
+        "2026-07-10",
+        "--tz",
+        "America/New_York",
+        "--client",
+        "codex",
+        "--no-scan",
+        "--json",
+    ]);
+    let rows = json_value(&report)["rows"]
+        .as_array()
+        .expect("Codex report rows")
+        .clone();
+    let codex = row_for_model(&rows, "gpt-5.4");
+    assert_eq!(codex["input_tokens_total"], 200);
+    assert_eq!(codex["output_tokens_total"], 20);
+    assert_database_excludes(
+        &fixture.database,
+        &[RAW_SESSION, PARENT_THREAD, CHILD_THREAD],
+    );
+}
+
+#[test]
+fn shifted_codex_copy_after_migration_is_provisional_without_duplicate_usage() {
+    const RAW_SESSION: &str = "codex-session-known";
+    const PARENT_THREAD: &str = "11111111-1111-7111-8111-111111111111";
+    const CHILD_THREAD: &str = "33333333-3333-7333-8333-333333333333";
+    const BOUNDARY: &str = "i=200;ci=50;o=20;ro=8;t=220;w5=0;w1=0;wu=0";
+
+    let fixture = CliFixture::create();
+    fixture.initialize();
+    fixture.run(&["scan", "--client", "codex"]);
+    let parent = fixture
+        .codex_home
+        .join("sessions/2026/07/10")
+        .join(format!("rollout-2026-07-10T14-00-00-{PARENT_THREAD}.jsonl"));
+    let child = fixture
+        .codex_home
+        .join("sessions/2026/07/10")
+        .join(format!("rollout-2026-07-10T14-00-00-{CHILD_THREAD}.jsonl"));
+    let legacy_event_key = stable_id_parts(&["codex-counter-boundary", RAW_SESSION, "0", BOUNDARY]);
+    let legacy_state = serde_json::json!({
+        "canonical_meta_seen": true,
+        "logical_session_id": RAW_SESSION,
+        "physical_thread_id": PARENT_THREAD,
+        "epoch": 0,
+        "previous": {
+            "input": 200,
+            "cached_input": 50,
+            "output": 20,
+            "reasoning_output": 8,
+            "total": 220,
+            "cache_write_5m": 0,
+            "cache_write_1h": 0,
+            "cache_write_unknown": 0,
+            "cached_input_reported": true,
+            "reasoning_output_reported": true,
+            "cache_write_reported": true
+        }
+    });
+    {
+        let connection = Connection::open(&fixture.database).expect("open v4 source ledger");
+        connection
+            .execute(
+                r#"UPDATE usage_observations SET event_key=?1, session_id=?2
+                   WHERE client='openai_codex'"#,
+                rusqlite::params![legacy_event_key, RAW_SESSION],
+            )
+            .expect("restore legacy event identity");
+        connection
+            .execute(
+                r#"UPDATE source_files SET adapter_state=?1
+                   WHERE client='openai_codex'"#,
+                [legacy_state.to_string()],
+            )
+            .expect("restore legacy state");
+        connection
+            .execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])
+            .expect("mark v4 ledger");
+    }
+    fixture.run(&["scan", "--client", "codex", "--rebuild"]);
+
+    // The copy appears only after migration. Prefixing an accounting-irrelevant
+    // blank line shifts its immutable locator, so it cannot be globally
+    // anchored. Its matching private scope+ordinal must fail closed.
+    let shifted = format!(
+        "\n{}",
+        fs::read_to_string(&parent)
+            .expect("read migrated parent rollout")
+            .replace(PARENT_THREAD, CHILD_THREAD)
+    );
+    fs::write(&child, shifted).expect("write shifted post-migration copy");
+    fixture.run(&["scan", "--client", "codex"]);
+
+    let connection = Connection::open(&fixture.database).expect("open shifted-copy ledger");
+    let (observations, canonical_events, child_observations, status, provisional): (
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+    ) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM usage_observations WHERE client='openai_codex'),
+                   (SELECT COUNT(*) FROM (
+                       SELECT event_key FROM usage_observations
+                       WHERE client='openai_codex' GROUP BY event_key
+                   )),
+                   (SELECT COUNT(*) FROM usage_observations o
+                    JOIN source_files s ON s.id=o.source_file_id
+                    WHERE s.path=(SELECT path FROM source_files
+                                  WHERE client='openai_codex'
+                                  ORDER BY id DESC LIMIT 1)),
+                   (SELECT status FROM scan_runs ORDER BY id DESC LIMIT 1),
+                   (SELECT provisional FROM scan_runs ORDER BY id DESC LIMIT 1)"#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("read shifted-copy scan outcome");
+    assert_eq!(observations, 1);
+    assert_eq!(canonical_events, 1);
+    assert_eq!(child_observations, 0);
+    assert_eq!(status, "partial");
+    assert_eq!(provisional, 1);
+    let (warning_code, warning_message): (String, String) = connection
+        .query_row(
+            r#"SELECT code, message FROM scan_warnings
+               ORDER BY id DESC LIMIT 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read sanitized shifted-copy warning");
+    assert_eq!(warning_code, "source_scan_failed");
+    assert_eq!(
+        warning_message,
+        "warning details redacted at the storage boundary"
+    );
+}
+
+#[test]
 fn unknown_model_cost_is_null_and_explicitly_unpriced_never_zero() {
     let fixture = CliFixture::create();
     fixture.initialize();
@@ -506,7 +1004,7 @@ fn v02_reports_filter_render_html_and_offer_human_drilldown() {
         .expect("human summary");
     let table_at = human_text.find("BY MODEL").expect("human table");
     assert!(summary_at < table_at, "summary should precede table");
-    assert!(human_text.contains("ledger explain --event evt_"));
+    assert!(human_text.contains("token-ledger explain --event evt_"));
     assert!(human_text.contains("Snapshot "));
 
     let event_id = stable_event_id("claude_code", "message:msg-claude-known");
@@ -790,8 +1288,12 @@ fn canonical_event_count(database: &Path) -> i64 {
 }
 
 fn stable_event_id(client: &str, event_key: &str) -> String {
+    stable_id_parts(&[client, event_key])
+}
+
+fn stable_id_parts(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    for part in [client, event_key] {
+    for part in parts {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
@@ -813,6 +1315,10 @@ fn assert_output_private(output: &Output) {
 }
 
 fn assert_database_private(database: &Path) {
+    assert_database_excludes(database, &[PRIVACY_CANARY]);
+}
+
+fn assert_database_excludes(database: &Path, markers: &[&str]) {
     let directory = database.parent().expect("database parent");
     let base = database
         .file_name()
@@ -825,12 +1331,14 @@ fn assert_database_private(database: &Path) {
             continue;
         }
         let bytes = fs::read(entry.path()).expect("read database family file");
-        assert!(
-            !bytes
-                .windows(PRIVACY_CANARY.len())
-                .any(|window| window == PRIVACY_CANARY.as_bytes()),
-            "privacy canary leaked into {}",
-            entry.path().display()
-        );
+        for marker in markers {
+            assert!(
+                !bytes
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes()),
+                "private marker {marker:?} leaked into {}",
+                entry.path().display()
+            );
+        }
     }
 }

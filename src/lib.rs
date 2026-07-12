@@ -6,6 +6,7 @@ pub mod billing;
 pub mod config;
 pub mod cost;
 pub mod db;
+pub mod demo;
 pub mod html;
 pub mod model;
 pub mod pricing;

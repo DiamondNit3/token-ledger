@@ -76,7 +76,7 @@ impl CostFixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("ledger").expect("compiled ledger");
+        let mut command = Command::cargo_bin("token-ledger").expect("compiled token-ledger");
         command.arg("--config").arg(&self.config);
         command
     }

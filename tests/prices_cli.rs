@@ -45,7 +45,7 @@ impl PriceFixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("ledger").unwrap();
+        let mut command = Command::cargo_bin("token-ledger").unwrap();
         command.arg("--config").arg(&self.config_path);
         command
     }
