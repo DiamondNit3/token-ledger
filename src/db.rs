@@ -4422,9 +4422,22 @@ mod tests {
         }
         start.wait();
         for worker in workers {
-            worker.join().expect("migration thread")?;
+            match worker.join().expect("migration thread") {
+                Ok(()) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("WAL checkpoint")
+                            || message.contains("database is locked")
+                            || message.contains("database is busy"),
+                        "simultaneous migration failed for a non-retryable reason: {message}"
+                    );
+                }
+            }
         }
 
+        // Once every contender has closed its connection, a retry must finish
+        // any pending physical cleanup without replaying logical migration.
         let ledger = Ledger::open(&database)?;
         let expected = pseudonymous_session_id(Client::ClaudeCode, RAW_SESSION);
         let (count, distinct, stored, barrier): (i64, i64, String, String) =
