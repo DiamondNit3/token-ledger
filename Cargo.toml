@@ -52,7 +52,7 @@ hex = "0.4"
 iana-time-zone = "0.1"
 indicatif = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 rust_decimal = { version = "1.36", features = ["serde", "serde-with-str"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
