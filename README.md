@@ -10,6 +10,9 @@ Know which models consumed your locally recorded Claude Code and OpenAI Codex to
 
 > Unofficial community project. Token Ledger is not affiliated with, endorsed by, or sponsored by OpenAI or Anthropic.
 
+> [!CAUTION]
+> **Upgrading a v0.4.1 ledger requires deliberate migration.** Retain the original Claude Code and Codex session files and export or back up the v0.4.1 ledger before first opening it with a newer release. The privacy barrier deletes cached observations, scan history, warnings, and reconciliation imports; history whose source files have expired or been deleted cannot be rebuilt. After backup, run `token-ledger migrate --accept-history-loss`, then `token-ledger scan --rebuild` and re-import reconciliation exports. Ordinary commands fail closed until you do this.
+
 ## Installation
 
 Download the archive for Windows x64, Linux x64, macOS Intel, or macOS Apple Silicon from [GitHub Releases](https://github.com/DiamondNit3/token-ledger/releases/latest). Verify the archive against `SHA256SUMS.txt`, extract it, and place `token-ledger` (or `token-ledger.exe`) on your `PATH`.
@@ -44,6 +47,7 @@ token-ledger cost --month
 token-ledger [--config <PATH>] [--db <PATH>] [--claude-root <PATH>] [--codex-home <PATH>] [--catalog-revision <REVISION>] [--color auto|always|never] [--unicode auto|always|never] [--plain] [--details] <COMMAND>
 token-ledger demo
 token-ledger init [--tz <IANA_ZONE>] [--force]
+token-ledger migrate [--accept-history-loss]
 token-ledger doctor
 token-ledger scan [--client claude|codex] [--since <DATE_OR_TIMESTAMP>] [--rebuild|--full] [--dry-run]
 token-ledger day <YYYY-MM-DD|today|yesterday> [--tz <IANA_ZONE>] [--no-scan] [--client ...] [--model ...] [--json|--html [PATH]]
@@ -107,6 +111,8 @@ Unknown price data is never treated as `$0`. A partial row shows a known lower-b
 Claude and Codex transcript schemas are version-sensitive. Unknown records are skipped with sanitized warnings; known accounting records continue processing.
 
 Parsing is bounded per record, source, decompression stream, and scan invocation. Physical source files above 128 MiB are explicitly unsupported; this ceiling keeps the worst admitted source within the aggregate work budget instead of leaving it permanently scheduled but unscannable. When a run reaches an aggregate bound it rotates the source window on later runs and remains provisional. Completed discovery traversals page bounded candidate sets across later scans; if the hard directory-entry ceiling itself is reached, safe partial candidates are retained but an arbitrary flat or deep suffix remains unprovable and the snapshot stays provisional. Every admitted source receives an exact physical-content digest, so same-size rewrites with preserved timestamps invalidate stale accounting. Any compressed archive that cannot be parsed completely within the record, line, integrity, or decompression limits is explicitly unsupported: Token Ledger imports no partial prefix and will not claim that rescanning the unchanged archive can reach its suffix.
+
+Each admitted file is copied into a bounded private temporary snapshot; the scanner fingerprints and parses that same immutable snapshot, then verifies the live source again before committing. Source paths with detected symbolic-link or Windows reparse-point ancestors are rejected. Token Ledger is not a security sandbox for a source tree being actively manipulated by another hostile process; keep configured roots under your account's control.
 
 Every day/range report includes a conservative per-client coverage assessment. An empty report distinguishes no sources, no observations, a date outside the observed window, and no matching events inside the broader observed window. None of these states is presented as proof of zero provider usage.
 

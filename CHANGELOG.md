@@ -6,6 +6,20 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 No changes yet.
 
+## 0.4.3 - 2026-07-12
+
+### Launch safety
+
+- Made the destructive schema-v6 privacy barrier fail closed during ordinary commands and added `token-ledger migrate --accept-history-loss` as a deliberate authorization step.
+- Added prominent warnings to retain original session files and export or back up v0.4.1 data because history cannot be rebuilt when those source files have expired or been deleted.
+- Added a regression proving that an unapproved migration leaves a v6 observation cache intact even when its original source is absent.
+
+### Scanner hardening
+
+- Parse each admitted source from a bounded private snapshot whose exact digest is compared with the post-parse live source, closing the hash-before-parse mutation gap.
+- Reject detected symbolic-link and Windows reparse-point ancestors in addition to the final source component, while documenting that the CLI is not a sandbox for hostile concurrently controlled source trees.
+- Charge every stability retry against the 2 GiB aggregate work budget instead of reusing the first attempt's reservation.
+
 ## 0.4.2 - 2026-07-12
 
 ### Fixed

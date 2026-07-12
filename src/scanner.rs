@@ -836,6 +836,11 @@ impl SourceWorkReservation<'_> {
         self.reserved_bytes = opened_work;
         true
     }
+
+    fn admit_attempt(&mut self, opened_work: u64, attempt: usize) -> bool {
+        let cumulative = opened_work.saturating_mul((attempt as u64).saturating_add(1));
+        self.admit(cumulative)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -894,15 +899,24 @@ fn scan_one(
             )));
         }
         let opened_work = estimate_source_work_for_size(metadata.len(), source.compressed, limits);
-        if !work_reservation.admit(opened_work) {
+        if !work_reservation.admit_attempt(opened_work, attempt) {
             return Ok(SourceOutcome::Limited(ScanWarning::new(
                 "scan_resource_limit",
-                "source changed after scheduling and exceeded the remaining aggregate work budget; it was not read",
+                "source changed or required another stability attempt that exceeded the remaining aggregate work budget; it was not read again",
             )));
         }
-        let before = source_fingerprint_from_file(&file)
-            .with_context(|| format!("failed to fingerprint {}", source.path.display()))?;
-        let prepared = prepare_source(ledger, adapter, source, options, &file, &before, limits);
+        let (snapshot, before) =
+            match snapshot_source(&file, &metadata, limits.max_source_file_bytes) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    active_during_scan = true;
+                    if attempt + 1 == SOURCE_STABILITY_ATTEMPTS {
+                        return Ok(SourceOutcome::Volatile);
+                    }
+                    continue;
+                }
+            };
+        let prepared = prepare_source(ledger, adapter, source, options, &snapshot, &before, limits);
         let after = source_fingerprint(&source.path);
 
         let stable = after
@@ -1544,6 +1558,41 @@ fn source_fingerprint_from_file(file: &File) -> Result<SourceFingerprint> {
     })
 }
 
+/// Copies one admitted source into an unlinked private temporary file and
+/// fingerprints those exact bytes. Parsing the snapshot prevents concurrent
+/// same-inode edits from injecting bytes between the integrity check and the
+/// parser. The original handle is used only to capture and later validate the
+/// source; observations are never parsed from a live, mutable file.
+fn snapshot_source(
+    source: &File,
+    metadata_before: &Metadata,
+    max_source_file_bytes: u64,
+) -> Result<(File, SourceFingerprint)> {
+    if metadata_before.len() > max_source_file_bytes {
+        anyhow::bail!("source exceeded the bounded file-size limit");
+    }
+    let mut input = source.try_clone()?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut snapshot = tempfile::tempfile().context("failed to create private source snapshot")?;
+    let copied = io::copy(
+        &mut input.take(max_source_file_bytes.saturating_add(1)),
+        &mut snapshot,
+    )?;
+    if copied != metadata_before.len() || copied > max_source_file_bytes {
+        anyhow::bail!("source changed size while its bounded snapshot was captured");
+    }
+    let metadata_after = source.metadata()?;
+    if metadata_after.len() != metadata_before.len()
+        || modified_ns(&metadata_after) != modified_ns(metadata_before)
+    {
+        anyhow::bail!("source changed while its bounded snapshot was captured");
+    }
+    snapshot.seek(SeekFrom::Start(0))?;
+    let mut fingerprint = source_fingerprint_from_file(&snapshot)?;
+    fingerprint.modified_ns = modified_ns(metadata_before);
+    Ok((snapshot, fingerprint))
+}
+
 fn hash_exact_prefix_file(file: &File, length: u64) -> Result<String> {
     let mut file = file.try_clone()?;
     let mut hasher = Sha256::new();
@@ -1557,6 +1606,7 @@ fn hash_exact_prefix_file(file: &File, length: u64) -> Result<String> {
 /// link or Windows reparse point. The returned handle is the authority for
 /// metadata, fingerprinting, checkpoint validation, and parsing.
 fn open_source_file(path: &Path) -> io::Result<File> {
+    validate_no_link_ancestors(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
 
@@ -1575,6 +1625,7 @@ fn open_source_file(path: &Path) -> io::Result<File> {
     }
 
     let file = options.open(path)?;
+    validate_no_link_ancestors(path)?;
     let metadata = file.metadata()?;
 
     #[cfg(windows)]
@@ -1596,6 +1647,37 @@ fn open_source_file(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+/// Rejects symbolic-link and Windows reparse-point ancestors. The final
+/// component is also protected by the no-follow open above. This is a
+/// defense-in-depth pathname check; Token Ledger is not a sandbox for source
+/// trees controlled by a concurrent hostile process.
+fn validate_no_link_ancestors(path: &Path) -> io::Result<()> {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source has a symbolic-link ancestor",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source has a reparse-point ancestor",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hash_file_range(file: &mut File, start: u64, length: u64, hasher: &mut Sha256) -> Result<()> {
@@ -1675,6 +1757,89 @@ mod tests {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn create_test_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory symlinks are unsupported on this platform",
+            ))
+        }
+    }
+
+    #[test]
+    fn source_with_linked_ancestor_is_rejected() -> Result<()> {
+        let directory = tempdir()?;
+        let real_parent = directory.path().join("real");
+        std::fs::create_dir(&real_parent)?;
+        std::fs::write(real_parent.join("source.jsonl"), b"{}\n")?;
+        let linked_parent = directory.path().join("linked");
+        match create_test_dir_symlink(&real_parent, &linked_parent) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                ) || error.raw_os_error() == Some(1314) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let error = open_source_file(&linked_parent.join("source.jsonl"))
+            .expect_err("linked ancestor must be rejected");
+        assert!(error.to_string().contains("ancestor"));
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_snapshot_digest_matches_the_bytes_that_are_parsed() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("source.jsonl");
+        std::fs::write(&path, b"original\n")?;
+        let source = open_source_file(&path)?;
+        let metadata = source.metadata()?;
+        let original_mtime = metadata.modified()?;
+        let (snapshot, snapshot_fingerprint) =
+            snapshot_source(&source, &metadata, MAX_SOURCE_FILE_BYTES)?;
+
+        std::fs::write(&path, b"injected\n")?;
+        let rewritten = OpenOptions::new().write(true).open(&path)?;
+        rewritten.set_times(FileTimes::new().set_modified(original_mtime))?;
+
+        assert_eq!(
+            snapshot_fingerprint.sample_hash,
+            source_fingerprint_from_file(&snapshot)?.sample_hash
+        );
+        assert_ne!(
+            snapshot_fingerprint.sample_hash,
+            source_fingerprint(&path)?.sample_hash
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stability_retries_consume_additional_aggregate_work() {
+        let mut remaining = 10;
+        let mut reservation = SourceWorkReservation {
+            reserved_bytes: 10,
+            remaining_bytes: &mut remaining,
+        };
+        assert!(reservation.admit_attempt(10, 0));
+        assert!(reservation.admit_attempt(10, 1));
+        assert!(!reservation.admit_attempt(10, 2));
+        assert_eq!(remaining, 0);
     }
 
     fn claude_record(id: &str, output_tokens: u64) -> String {

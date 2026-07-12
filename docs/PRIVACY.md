@@ -29,7 +29,7 @@ Stored event, session, message, request, import, and source identifiers are dete
 
 `show_raw_ids = true` shows complete stored pseudonyms instead of shortened display references. It cannot recover raw provider identifiers because those values are not retained.
 
-Schema v7 is the current privacy boundary. It acquires exclusive migration access before reading the prior version, advances each version with a compare-and-swap check, and installs database triggers that reject schema downgrades and legacy writes. A pre-barrier schema-v6 completion marker cannot prove that an older process did not write raw identifiers after the earlier scrub, so v0.4.2 invalidates schema-v6 source, observation, warning, and reconciliation caches instead of trusting or double-hashing mixed rows. The next scan rebuilds accounting from authoritative local sources; provider reconciliation exports must be re-imported.
+Schema v7 is the current privacy boundary. It acquires exclusive migration access before reading the prior version, advances each version with a compare-and-swap check, and installs database triggers that reject schema downgrades and legacy writes. A pre-barrier schema-v6 completion marker cannot prove that an older process did not write raw identifiers after the earlier scrub, so the barrier invalidates schema-v6 source, observation, warning, and reconciliation caches instead of trusting or double-hashing mixed rows. This invalidation is irreversible when authoritative local sources no longer exist. Ordinary commands therefore fail closed on a v0.4.1-era database until the user retains source files, exports or backs up the database, and deliberately runs `token-ledger migrate --accept-history-loss`. The next scan rebuilds accounting from retained sources; provider reconciliation exports must be re-imported.
 
 Upgrades from older schemas reapply the required identifier storage boundaries and use SQLite secure deletion, checked WAL truncation, and a post-migration vacuum so removed identifier values are physically scrubbed on a best-effort basis. Cleanup remains durably marked as pending until those physical steps succeed, so an interrupted or busy cleanup is retried without transforming retained logical rows twice.
 
@@ -61,6 +61,8 @@ Purge cannot erase external backups, filesystem snapshots, crash dumps, exported
 ## Threat model limitations
 
 Token Ledger does not protect data from an attacker who already has equivalent access to the user's account or filesystem. It does not encrypt its database. Local filesystem permissions, device encryption, backup policy, and operating-system security remain the user's responsibility.
+
+The scanner rejects detected symbolic-link and Windows reparse-point source components, parses a bounded private snapshot, and verifies the live source before commit. It is not a sandbox for session roots that a hostile process can concurrently replace or manipulate. Configure only roots controlled by the same trusted account.
 
 Model names, timestamps, token totals, price dimensions, and billing evidence can reveal work patterns even without transcript content.
 
