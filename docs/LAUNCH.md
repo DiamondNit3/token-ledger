@@ -15,6 +15,10 @@ Do not announce broadly until all of these are true:
 - known limitations and unsigned macOS status are explicit; and
 - at least two people other than the maintainer can complete installation from the README.
 
+### Current gate status
+
+The independent-install requirement is **not yet met**. As of 2026-07-12, the project has no public evidence that two non-maintainers completed the README installation successfully. Release download counts, stars, and maintainer-run platform smoke tests do not satisfy this requirement. Record confirmation only when an external user reports the platform, release version, installation path, and successful `token-ledger demo` result; never infer it from analytics.
+
 ## Community sequence
 
 Post separately and adapt the explanation to each audience. Verify each community's current rules immediately before posting; never cross-post identical promotional copy in a burst.

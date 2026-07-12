@@ -81,8 +81,6 @@ jobs:
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4 # 1.88.0
-        with:
-          toolchain: 1.88.0
 
       - name: Run tests on the minimum supported Rust version
         run: cargo test --all-targets --locked
