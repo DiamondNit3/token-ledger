@@ -2932,7 +2932,11 @@ mod tests {
         assert_eq!(summary.observations, 0);
         assert!(summary.provisional);
         assert!(ledger.canonical_events(None, None)?.is_empty());
-        assert!(ledger.source_checkpoint(&link)?.is_none());
+        let rejected = ledger
+            .source_checkpoint(&link)?
+            .context("rejected source warning should retain a bounded source reference")?;
+        assert_eq!(rejected.file_size, 0);
+        assert_eq!(rejected.checkpoint_offset, 0);
         assert!(ledger.source_checkpoint(&target)?.is_none());
         Ok(())
     }
