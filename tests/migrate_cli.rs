@@ -169,6 +169,105 @@ fn models_rejects_a_renamed_damaged_table_before_bootstrap() {
 }
 
 #[test]
+fn models_rejects_spoofed_or_malformed_versioned_databases_without_mutation() {
+    let fixture = MigrationFixture::create();
+    fixture.initialize();
+
+    for (index, version) in ["7", "7garbage"].into_iter().enumerate() {
+        let database = fixture._temp.path().join(format!("spoofed-{index}.sqlite"));
+        let original_journal_mode = {
+            let connection = Connection::open(&database).expect("create unrelated database");
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO meta(key, value) VALUES ('schema_version', '{version}');
+                     CREATE TABLE application_records(id INTEGER PRIMARY KEY, secret TEXT);"
+                ))
+                .expect("create spoofed metadata");
+            connection
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .expect("read initial journal mode")
+        };
+
+        let output = fixture
+            .command()
+            .arg("--db")
+            .arg(&database)
+            .args(["models", "--json"])
+            .output()
+            .expect("run models against spoofed database");
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("required Token Ledger column shape")
+                || stderr(&output).contains("core Token Ledger schema cannot be proven")
+                || stderr(&output).contains("not a canonical integer"),
+            "unexpected refusal: {}",
+            stderr(&output)
+        );
+
+        let connection = Connection::open(&database).expect("reopen unrelated database");
+        let token_ledger_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='table' AND name IN ('source_files', 'usage_observations', 'scan_runs')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check bootstrap tables");
+        assert_eq!(token_ledger_tables, 0);
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("read final journal mode");
+        assert_eq!(journal_mode, original_journal_mode);
+    }
+}
+
+#[test]
+fn models_treats_retained_sqlite_sequence_as_existing_state() {
+    let fixture = MigrationFixture::create();
+    fixture.initialize();
+    let database = &fixture.target_database;
+    {
+        let connection = Connection::open(database).expect("create sqlite_sequence fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE discarded(id INTEGER PRIMARY KEY AUTOINCREMENT);
+                 INSERT INTO discarded DEFAULT VALUES;
+                 DROP TABLE discarded;",
+            )
+            .expect("retain sqlite_sequence");
+    }
+
+    let output = fixture
+        .command()
+        .arg("--db")
+        .arg(database)
+        .args(["models", "--json"])
+        .output()
+        .expect("run models against sqlite_sequence fixture");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("schema metadata is missing or invalid"));
+
+    let connection = Connection::open(database).expect("reopen sqlite_sequence fixture");
+    let retained: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='sqlite_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read sqlite_sequence schema object");
+    assert_eq!(retained, 1);
+    let replacement_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='source_files'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check replacement table");
+    assert_eq!(replacement_count, 0);
+}
+
+#[test]
 fn important_confirmation_scan_and_export_flags_have_help_text() {
     let cases = [
         (

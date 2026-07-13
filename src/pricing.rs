@@ -27,6 +27,9 @@ use crate::model::{
 
 const CATALOG_SCHEMA_VERSION: u32 = 1;
 const OFFICIAL_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MAX_CATALOG_COLLECTION_ENTRIES: usize = 2_048;
+const MAX_CATALOG_DECIMAL_MAGNITUDE: u64 = 1_000_000_000;
+const MAX_PRICING_RESULT_MAGNITUDE: u64 = 1_000_000_000_000_000_000;
 const BUNDLED_CATALOG: &[u8] = include_bytes!("../assets/prices.json");
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1843,11 +1846,40 @@ impl PricingEngine {
                     .all(|(key, expected)| resolved_dimensions.get(key) == Some(expected))
         }) {
             match modifier.scope {
-                ModifierScope::TokenRates => token_multiplier *= modifier.multiplier.0,
-                ModifierScope::ToolRates => tool_multiplier *= modifier.multiplier.0,
+                ModifierScope::TokenRates => {
+                    let Some(value) =
+                        checked_pricing_product(token_multiplier, modifier.multiplier.0)
+                    else {
+                        return KindEstimate::unpriced(
+                            kind,
+                            "Pricing modifier multiplication exceeds the supported decimal range.",
+                        );
+                    };
+                    token_multiplier = value;
+                }
+                ModifierScope::ToolRates => {
+                    let Some(value) =
+                        checked_pricing_product(tool_multiplier, modifier.multiplier.0)
+                    else {
+                        return KindEstimate::unpriced(
+                            kind,
+                            "Pricing modifier multiplication exceeds the supported decimal range.",
+                        );
+                    };
+                    tool_multiplier = value;
+                }
                 ModifierScope::All => {
-                    token_multiplier *= modifier.multiplier.0;
-                    tool_multiplier *= modifier.multiplier.0;
+                    let (Some(token_value), Some(tool_value)) = (
+                        checked_pricing_product(token_multiplier, modifier.multiplier.0),
+                        checked_pricing_product(tool_multiplier, modifier.multiplier.0),
+                    ) else {
+                        return KindEstimate::unpriced(
+                            kind,
+                            "Pricing modifier multiplication exceeds the supported decimal range.",
+                        );
+                    };
+                    token_multiplier = token_value;
+                    tool_multiplier = tool_value;
                 }
             }
             matched_rate_ids.push(modifier.id.clone());
@@ -1925,10 +1957,27 @@ impl PricingEngine {
                 });
                 continue;
             };
-            let effective_rate = rate.0 * token_multiplier;
-            let component_cost =
-                Decimal::from(quantity) * effective_rate / Decimal::from(rule.unit_scale);
-            subtotal += component_cost;
+            let Some(effective_rate) = checked_pricing_product(rate.0, token_multiplier) else {
+                return KindEstimate::unpriced(
+                    kind,
+                    "Effective token rate exceeds the supported decimal range.",
+                );
+            };
+            let Some(component_cost) =
+                checked_component_cost(quantity, effective_rate, rule.unit_scale)
+            else {
+                return KindEstimate::unpriced(
+                    kind,
+                    "Token pricing product exceeds the supported decimal range.",
+                );
+            };
+            let Some(next_subtotal) = checked_pricing_sum(subtotal, component_cost) else {
+                return KindEstimate::unpriced(
+                    kind,
+                    "Pricing subtotal exceeds the supported decimal range.",
+                );
+            };
+            subtotal = next_subtotal;
             priced_component_count += 1;
             explanation.push(format!(
                 "{component}: {quantity} × {effective_rate} {} / {} = {component_cost} {}.",
@@ -1955,10 +2004,27 @@ impl PricingEngine {
                 });
                 continue;
             };
-            let effective_rate = rate.rate.0 * tool_multiplier;
-            let component_cost =
-                Decimal::from(quantity) * effective_rate / Decimal::from(rate.per_units);
-            subtotal += component_cost;
+            let Some(effective_rate) = checked_pricing_product(rate.rate.0, tool_multiplier) else {
+                return KindEstimate::unpriced(
+                    kind,
+                    "Effective tool rate exceeds the supported decimal range.",
+                );
+            };
+            let Some(component_cost) =
+                checked_component_cost(quantity, effective_rate, rate.per_units)
+            else {
+                return KindEstimate::unpriced(
+                    kind,
+                    "Tool pricing product exceeds the supported decimal range.",
+                );
+            };
+            let Some(next_subtotal) = checked_pricing_sum(subtotal, component_cost) else {
+                return KindEstimate::unpriced(
+                    kind,
+                    "Pricing subtotal exceeds the supported decimal range.",
+                );
+            };
+            subtotal = next_subtotal;
             priced_component_count += 1;
             explanation.push(format!(
                 "{component}: {quantity} × {effective_rate} {} / {} requests = {component_cost} {}{}.",
@@ -2000,16 +2066,24 @@ impl PricingEngine {
                 && missing.len() == 1
                 && missing[0].component == "cache_write_observation")
                 .then(|| {
-                    let input_rate = rule.rates.input?.0 * token_multiplier;
-                    let write_rate = rule.rates.cache_write?.0 * token_multiplier;
-                    let input_cost = Decimal::from(usage.input_tokens_uncached) * input_rate
-                        / Decimal::from(rule.unit_scale);
-                    let reclassified_cost = Decimal::from(usage.input_tokens_uncached) * write_rate
-                        / Decimal::from(rule.unit_scale);
-                    let other = subtotal - input_cost;
+                    let input_rate =
+                        checked_pricing_product(rule.rates.input?.0, token_multiplier)?;
+                    let write_rate =
+                        checked_pricing_product(rule.rates.cache_write?.0, token_multiplier)?;
+                    let input_cost = checked_component_cost(
+                        usage.input_tokens_uncached,
+                        input_rate,
+                        rule.unit_scale,
+                    )?;
+                    let reclassified_cost = checked_component_cost(
+                        usage.input_tokens_uncached,
+                        write_rate,
+                        rule.unit_scale,
+                    )?;
+                    let other = checked_pricing_difference(subtotal, input_cost)?;
                     Some((
-                        other + input_cost.min(reclassified_cost),
-                        other + input_cost.max(reclassified_cost),
+                        checked_pricing_sum(other, input_cost.min(reclassified_cost))?,
+                        checked_pricing_sum(other, input_cost.max(reclassified_cost))?,
                     ))
                 })
                 .flatten();
@@ -3205,6 +3279,28 @@ fn verify_document(document: &CatalogDocument) -> VerificationReport {
         );
     }
 
+    let mut collection_limit_exceeded = false;
+    for (name, count) in [
+        ("sources", document.sources.len()),
+        ("aliases", document.aliases.len()),
+        ("rates", document.rates.len()),
+        ("modifiers", document.modifiers.len()),
+    ] {
+        if count > MAX_CATALOG_COLLECTION_ENTRIES {
+            collection_limit_exceeded = true;
+            error(
+                "collection_limit",
+                format!(
+                    "catalog {name} contains {count} entries; the safety limit is {MAX_CATALOG_COLLECTION_ENTRIES}"
+                ),
+            );
+        }
+    }
+    if collection_limit_exceeded {
+        report.valid = false;
+        return report;
+    }
+
     let mut source_ids = HashSet::new();
     for source in &document.sources {
         if !source_ids.insert(source.id.as_str()) {
@@ -3278,6 +3374,15 @@ fn verify_document(document: &CatalogDocument) -> VerificationReport {
                     format!("rate '{}' component '{component}' is negative", rule.id),
                 );
             }
+            if value.is_some_and(|value| !catalog_decimal_magnitude_is_safe(value.0)) {
+                error(
+                    "rate_magnitude",
+                    format!(
+                        "rate '{}' component '{component}' exceeds the supported decimal magnitude",
+                        rule.id
+                    ),
+                );
+            }
         }
         if !rule.rates.any_cache_write_rate() && rule.cache_write_observation_required {
             // This is valid for Codex credits: the missing official cache-write
@@ -3296,6 +3401,15 @@ fn verify_document(document: &CatalogDocument) -> VerificationReport {
                     "invalid_tool_rate",
                     format!(
                         "rate '{}' tool '{name}' must be positive or explicitly free",
+                        rule.id
+                    ),
+                );
+            }
+            if !catalog_decimal_magnitude_is_safe(rate.rate.0) {
+                error(
+                    "tool_rate_magnitude",
+                    format!(
+                        "rate '{}' tool '{name}' exceeds the supported decimal magnitude",
                         rule.id
                     ),
                 );
@@ -3371,6 +3485,15 @@ fn verify_document(document: &CatalogDocument) -> VerificationReport {
                 format!("modifier '{}' is not positive", modifier.id),
             );
         }
+        if !catalog_decimal_magnitude_is_safe(modifier.multiplier.0) {
+            error(
+                "modifier_magnitude",
+                format!(
+                    "modifier '{}' exceeds the supported decimal magnitude",
+                    modifier.id
+                ),
+            );
+        }
         if modifier.selectors.is_empty() {
             error(
                 "empty_modifier_selector",
@@ -3434,6 +3557,36 @@ fn verify_document(document: &CatalogDocument) -> VerificationReport {
         .iter()
         .any(|issue| issue.severity == VerificationSeverity::Error);
     report
+}
+
+fn catalog_decimal_magnitude_is_safe(value: Decimal) -> bool {
+    let maximum = Decimal::from(MAX_CATALOG_DECIMAL_MAGNITUDE);
+    value >= -maximum && value <= maximum
+}
+
+fn checked_pricing_product(left: Decimal, right: Decimal) -> Option<Decimal> {
+    let value = left.checked_mul(right)?;
+    let maximum = Decimal::from(MAX_PRICING_RESULT_MAGNITUDE);
+    (value >= -maximum && value <= maximum).then_some(value)
+}
+
+fn checked_pricing_sum(left: Decimal, right: Decimal) -> Option<Decimal> {
+    pricing_magnitude_is_safe(left.checked_add(right)?)
+}
+
+fn checked_pricing_difference(left: Decimal, right: Decimal) -> Option<Decimal> {
+    pricing_magnitude_is_safe(left.checked_sub(right)?)
+}
+
+fn pricing_magnitude_is_safe(value: Decimal) -> Option<Decimal> {
+    let maximum = Decimal::from(MAX_PRICING_RESULT_MAGNITUDE);
+    (value >= -maximum && value <= maximum).then_some(value)
+}
+
+fn checked_component_cost(quantity: u64, rate: Decimal, scale: u64) -> Option<Decimal> {
+    checked_pricing_product(Decimal::from(quantity), rate)?
+        .checked_div(Decimal::from(scale))
+        .and_then(pricing_magnitude_is_safe)
 }
 
 fn verify_record_id<'a>(
@@ -4144,6 +4297,81 @@ mod tests {
         let engine = PricingEngine::bundled().unwrap();
         let result = engine.validate_candidate_with_checksum(b"{}", "00");
         assert!(matches!(result, Err(PricingError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn catalog_rejects_extreme_decimal_magnitudes_and_collection_counts() {
+        let mut extreme: serde_json::Value = serde_json::from_slice(BUNDLED_CATALOG).unwrap();
+        extreme["rates"][0]["rates"]["input"] = serde_json::Value::String("1000000001".to_string());
+        let catalog = PriceCatalog::parse(&serde_json::to_vec(&extreme).unwrap()).unwrap();
+        let report = catalog.verify();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "rate_magnitude")
+        );
+
+        let mut crowded: serde_json::Value = serde_json::from_slice(BUNDLED_CATALOG).unwrap();
+        let template = crowded["aliases"][0].clone();
+        crowded["aliases"] = serde_json::Value::Array(
+            (0..=MAX_CATALOG_COLLECTION_ENTRIES)
+                .map(|index| {
+                    let mut alias = template.clone();
+                    alias["id"] = serde_json::Value::String(format!("bounded-alias-{index}"));
+                    alias["raw_model"] =
+                        serde_json::Value::String(format!("bounded-model-{index}"));
+                    alias
+                })
+                .collect(),
+        );
+        let catalog = PriceCatalog::parse(&serde_json::to_vec(&crowded).unwrap()).unwrap();
+        let report = catalog.verify();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "collection_limit")
+        );
+    }
+
+    #[test]
+    fn pricing_product_limit_returns_unpriced_instead_of_panicking() {
+        let mut catalog = PriceCatalog::parse(BUNDLED_CATALOG).unwrap();
+        let matching = catalog
+            .document
+            .rates
+            .iter_mut()
+            .find(|rule| {
+                rule.provider == "openai"
+                    && rule.canonical_model == "gpt-5.6-sol"
+                    && rule.kind == RateKind::UsdApiEquivalent
+            })
+            .unwrap();
+        matching.unit_scale = 1;
+        matching.rates.input = Some(ExactDecimal(Decimal::from(MAX_CATALOG_DECIMAL_MAGNITUDE)));
+        let engine = PricingEngine {
+            catalog,
+            dimension_overrides: Vec::new(),
+        };
+        let item = event(
+            Client::OpenaiCodex,
+            "openai",
+            "gpt-5.6-sol",
+            UsageVector {
+                input_tokens_total: u64::MAX,
+                input_tokens_uncached: u64::MAX,
+                ..Default::default()
+            },
+        );
+        let estimate = engine.estimate_event(&item);
+        assert_eq!(estimate.status, EstimateStatus::Unpriced);
+        assert!(
+            estimate
+                .explanation
+                .iter()
+                .any(|line| line.contains("supported decimal range"))
+        );
     }
 
     #[test]

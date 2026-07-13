@@ -141,3 +141,43 @@ fn malformed_import_does_not_echo_content_or_path() {
     assert!(!stderr.contains(SECRET));
     assert!(!stderr.contains("private-provider-export.json"));
 }
+
+#[test]
+fn extreme_reconciliation_values_exit_cleanly_without_a_panic() {
+    let fixture = Fixture::new();
+    let path = fixture._temp.path().join("extreme-values.json");
+    let maximum = rust_decimal::Decimal::MAX.to_string();
+    let document = serde_json::json!({
+        "schema_version": "token-ledger.reconciliation.v1",
+        "source_kind": "extreme_cost_fixture",
+        "buckets": [
+            {"start":"2026-07-10","end":"2026-07-11","provider":"openai","provider_metered_usd":maximum},
+            {"start":"2026-07-10","end":"2026-07-11","provider":"openai","provider_metered_usd":maximum}
+        ]
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec(&document).expect("serialize extreme fixture"),
+    )
+    .expect("write extreme reconciliation fixture");
+
+    let path_text = path.to_string_lossy().to_string();
+    let output = fixture
+        .command()
+        .args([
+            "reconcile",
+            "import",
+            &path_text,
+            "--format",
+            "canonical-json",
+            "--json",
+        ])
+        .output()
+        .expect("run extreme reconciliation import");
+    assert!(!output.status.success());
+    assert_ne!(output.status.code(), Some(101), "CLI must not panic");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("USD total exceeds"),
+        "CLI should report a bounded validation error"
+    );
+}

@@ -6,6 +6,19 @@ All notable user-facing changes to Token Ledger are recorded here. The project f
 
 No changes yet.
 
+## 0.4.6 - 2026-07-12
+
+### Security
+
+- Require a canonical integer schema version plus version-appropriate Token Ledger core tables and column shapes before changing an existing `--db` target; a spoofed `meta.schema_version`, malformed values such as `7garbage`, unrelated SQLite databases, and retained `sqlite_sequence` state now fail closed.
+- Delay Unix database permission hardening until after identity validation so a rejected existing database is not changed to mode `0600`.
+- Replace reconciliation decimal and counter saturation with checked aggregation that returns a normal validation error instead of panicking or clipping accounting.
+- Bound price-catalog source, alias, rate, and modifier collections before pairwise validation; reject extreme rate and modifier magnitudes and convert pricing product, multiplier, subtotal, and range overflow into an explicit unpriced result.
+
+### Tests
+
+- Added exact `models --json` regressions for plausible and malformed schema markers, retained SQLite internal state, extreme reconciliation CLI imports, catalog complexity limits, and extreme pricing products.
+
 ## 0.4.5 - 2026-07-12
 
 ### Security

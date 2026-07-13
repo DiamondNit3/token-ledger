@@ -119,17 +119,18 @@ impl ReconciliationCounters {
         }
     }
 
-    fn add_assign(&mut self, other: &Self) {
-        combine_complete(&mut self.request_count, other.request_count);
-        combine_complete(&mut self.input_tokens_uncached, other.input_tokens_uncached);
-        combine_complete(&mut self.input_tokens_cached, other.input_tokens_cached);
-        combine_complete(&mut self.cache_write_5m_tokens, other.cache_write_5m_tokens);
-        combine_complete(&mut self.cache_write_1h_tokens, other.cache_write_1h_tokens);
+    fn checked_add_assign(&mut self, other: &Self) -> Result<()> {
+        combine_complete(&mut self.request_count, other.request_count)?;
+        combine_complete(&mut self.input_tokens_uncached, other.input_tokens_uncached)?;
+        combine_complete(&mut self.input_tokens_cached, other.input_tokens_cached)?;
+        combine_complete(&mut self.cache_write_5m_tokens, other.cache_write_5m_tokens)?;
+        combine_complete(&mut self.cache_write_1h_tokens, other.cache_write_1h_tokens)?;
         combine_complete(
             &mut self.cache_write_unknown_tokens,
             other.cache_write_unknown_tokens,
-        );
-        combine_complete(&mut self.output_tokens, other.output_tokens);
+        )?;
+        combine_complete(&mut self.output_tokens, other.output_tokens)?;
+        Ok(())
     }
 }
 
@@ -466,7 +467,7 @@ pub fn report(
 
     for bucket in &selected {
         let exact_indices = matching_event_indices(&events, bucket, false);
-        let mut local = aggregate_local(&events, &exact_indices);
+        let mut local = aggregate_local(&events, &exact_indices)?;
         let provider_has_usage = bucket.counters.any_reported();
         if provider_has_usage {
             covered_events.extend(exact_indices.iter().copied());
@@ -493,7 +494,7 @@ pub fn report(
             } else {
                 let boundary_indices = matching_event_indices(&events, bucket, true);
                 if !boundary_indices.is_empty() && provider_has_usage {
-                    local = aggregate_local(&events, &boundary_indices);
+                    local = aggregate_local(&events, &boundary_indices)?;
                     classification = ReconciliationClassification::TimeBoundary;
                     explanation = "matching local activity exists only within one hour of an exclusive provider bucket boundary".to_string();
                 } else {
@@ -518,7 +519,7 @@ pub fn report(
                 explanation =
                     "one or more provider counters differ from the matching local aggregate"
                         .to_string();
-            } else if routing_unknown(bucket, &events, &exact_indices) {
+            } else if routing_unknown(bucket, &events, &exact_indices)? {
                 classification = ReconciliationClassification::RouteUnknown;
                 explanation = "token counters align, but routing dimensions are absent or cannot be uniquely matched".to_string();
             } else {
@@ -646,9 +647,12 @@ fn matching_event_indices(
         .collect()
 }
 
-fn aggregate_local(events: &[CanonicalEvent], indices: &[usize]) -> Option<ReconciliationSide> {
+fn aggregate_local(
+    events: &[CanonicalEvent],
+    indices: &[usize],
+) -> Result<Option<ReconciliationSide>> {
     if indices.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut counters = ReconciliationCounters {
         request_count: Some(0),
@@ -664,22 +668,22 @@ fn aggregate_local(events: &[CanonicalEvent], indices: &[usize]) -> Option<Recon
     let mut routes = BTreeSet::new();
     for index in indices {
         let event = &events[*index];
-        add_optional(&mut counters.request_count, Some(1));
+        add_optional(&mut counters.request_count, Some(1))?;
         add_optional(
             &mut counters.input_tokens_uncached,
             Some(event.usage.input_tokens_uncached),
-        );
+        )?;
         add_optional(
             &mut counters.input_tokens_cached,
             Some(event.usage.input_tokens_cached),
-        );
+        )?;
         if event.usage.cache_write_5m_tokens > 0
             || event.dimensions.cache_write_data_complete == Some(true)
         {
             add_optional(
                 &mut counters.cache_write_5m_tokens,
                 Some(event.usage.cache_write_5m_tokens),
-            );
+            )?;
         }
         if event.usage.cache_write_1h_tokens > 0
             || event.dimensions.cache_write_data_complete == Some(true)
@@ -687,7 +691,7 @@ fn aggregate_local(events: &[CanonicalEvent], indices: &[usize]) -> Option<Recon
             add_optional(
                 &mut counters.cache_write_1h_tokens,
                 Some(event.usage.cache_write_1h_tokens),
-            );
+            )?;
         }
         if event.usage.cache_write_unknown_tokens > 0
             || event.dimensions.cache_write_data_complete == Some(true)
@@ -695,12 +699,12 @@ fn aggregate_local(events: &[CanonicalEvent], indices: &[usize]) -> Option<Recon
             add_optional(
                 &mut counters.cache_write_unknown_tokens,
                 Some(event.usage.cache_write_unknown_tokens),
-            );
+            )?;
         }
         add_optional(
             &mut counters.output_tokens,
             Some(event.usage.output_tokens_total),
-        );
+        )?;
         if let Some(value) = event.dimensions.inference_geo.as_deref() {
             geos.insert(value.to_string());
         }
@@ -711,7 +715,7 @@ fn aggregate_local(events: &[CanonicalEvent], indices: &[usize]) -> Option<Recon
             routes.insert(value.to_string());
         }
     }
-    Some(ReconciliationSide {
+    Ok(Some(ReconciliationSide {
         counters,
         provider_metered_usd: None,
         routing: ReconciliationRouting {
@@ -719,7 +723,7 @@ fn aggregate_local(events: &[CanonicalEvent], indices: &[usize]) -> Option<Recon
             service_tier: unique_value(tiers),
             provider_route: unique_value(routes),
         },
-    })
+    }))
 }
 
 fn local_only_rows(
@@ -756,7 +760,7 @@ fn local_only_rows(
                 provider,
                 model: Some(model),
                 classification: ReconciliationClassification::LocalOnly,
-                local: aggregate_local(events, &indices),
+                local: aggregate_local(events, &indices)?,
                 provider_evidence: None,
                 deltas_provider_minus_local: ReconciliationDeltas::default(),
                 evidence_digest: None,
@@ -785,11 +789,11 @@ fn routing_unknown(
     bucket: &StoredReconciliationBucket,
     events: &[CanonicalEvent],
     indices: &[usize],
-) -> bool {
-    let local = aggregate_local(events, indices)
+) -> Result<bool> {
+    let local = aggregate_local(events, indices)?
         .map(|value| value.routing)
         .unwrap_or_default();
-    routing_field_unknown(
+    Ok(routing_field_unknown(
         bucket.routing.inference_geo.as_deref(),
         local.inference_geo.as_deref(),
     ) || routing_field_unknown(
@@ -800,7 +804,7 @@ fn routing_unknown(
         local.provider_route.as_deref(),
     ) || (bucket.provider == "anthropic"
         && bucket.routing.inference_geo.is_none()
-        && local.inference_geo.is_none())
+        && local.inference_geo.is_none()))
 }
 
 fn routing_field_unknown(provider: Option<&str>, local: Option<&str>) -> bool {
@@ -864,17 +868,27 @@ fn unique_value(values: BTreeSet<String>) -> Option<String> {
     (values.len() == 1).then(|| values.into_iter().next().unwrap())
 }
 
-fn add_optional(target: &mut Option<u64>, value: Option<u64>) {
+fn add_optional(target: &mut Option<u64>, value: Option<u64>) -> Result<()> {
     if let Some(value) = value {
-        *target = Some(target.unwrap_or(0).saturating_add(value));
+        *target = Some(
+            target
+                .unwrap_or(0)
+                .checked_add(value)
+                .context("local reconciliation counters exceed the u64 accounting limit")?,
+        );
     }
+    Ok(())
 }
 
-fn combine_complete(target: &mut Option<u64>, value: Option<u64>) {
+fn combine_complete(target: &mut Option<u64>, value: Option<u64>) -> Result<()> {
     *target = match (*target, value) {
-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(left), Some(right)) => Some(
+            left.checked_add(right)
+                .context("reconciliation import counters exceed the u64 accounting limit")?,
+        ),
         _ => None,
     };
+    Ok(())
 }
 
 fn is_canonical_json(value: &Value) -> bool {
@@ -1365,16 +1379,20 @@ fn normalize_buckets(buckets: &mut Vec<ReconciliationBucketDraft>) -> Result<()>
             bucket.routing.service_tier.clone(),
             bucket.routing.provider_route.clone(),
         );
-        normalized
-            .entry(key)
-            .and_modify(|existing| {
-                existing.counters.add_assign(&bucket.counters);
-                if let Some(amount) = bucket.provider_metered_usd {
-                    existing.provider_metered_usd =
-                        Some(existing.provider_metered_usd.unwrap_or(Decimal::ZERO) + amount);
-                }
-            })
-            .or_insert(bucket);
+        if let Some(existing) = normalized.get_mut(&key) {
+            existing.counters.checked_add_assign(&bucket.counters)?;
+            if let Some(amount) = bucket.provider_metered_usd {
+                existing.provider_metered_usd = Some(
+                    existing
+                        .provider_metered_usd
+                        .unwrap_or(Decimal::ZERO)
+                        .checked_add(amount)
+                        .context("reconciliation USD total exceeds the supported decimal range")?,
+                );
+            }
+        } else {
+            normalized.insert(key, bucket);
+        }
     }
     *buckets = normalized.into_values().collect();
     Ok(())
@@ -1542,6 +1560,39 @@ mod tests {
         let right = parse_import(raw, ImportFormat::CanonicalJson)?;
         assert_eq!(left.content_digest, right.content_digest);
         assert_eq!(left.content_digest.len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_extreme_usd_buckets_return_validation_error_instead_of_panicking() -> Result<()> {
+        let maximum = Decimal::MAX.to_string();
+        let document = serde_json::json!({
+            "schema_version": RECONCILIATION_SCHEMA_VERSION,
+            "source_kind": "extreme_cost_fixture",
+            "buckets": [
+                {"start":"2026-07-10","end":"2026-07-11","provider":"openai","provider_metered_usd":maximum},
+                {"start":"2026-07-10","end":"2026-07-11","provider":"openai","provider_metered_usd":maximum}
+            ]
+        });
+        let error = parse_import(&serde_json::to_vec(&document)?, ImportFormat::CanonicalJson)
+            .expect_err("extreme USD sum must be rejected");
+        assert!(error.to_string().contains("USD total exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_extreme_counter_buckets_reject_u64_overflow() -> Result<()> {
+        let document = serde_json::json!({
+            "schema_version": RECONCILIATION_SCHEMA_VERSION,
+            "source_kind": "extreme_usage_fixture",
+            "buckets": [
+                {"start":"2026-07-10","end":"2026-07-11","provider":"openai","input_tokens_uncached":u64::MAX},
+                {"start":"2026-07-10","end":"2026-07-11","provider":"openai","input_tokens_uncached":1}
+            ]
+        });
+        let error = parse_import(&serde_json::to_vec(&document)?, ImportFormat::CanonicalJson)
+            .expect_err("extreme counter sum must be rejected");
+        assert!(error.to_string().contains("u64 accounting limit"));
         Ok(())
     }
 
