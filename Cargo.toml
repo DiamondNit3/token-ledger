@@ -1,6 +1,6 @@
 [package]
 name = "token-ledger"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 rust-version = "1.88"
 description = "Local-first Claude Code and OpenAI Codex token usage ledger"

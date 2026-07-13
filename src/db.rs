@@ -98,7 +98,6 @@ impl Ledger {
         prepare_private_database_file(path)?;
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open ledger database {}", path.display()))?;
-        harden_sqlite_files(path)?;
         let ledger =
             Self::from_connection(connection, path.to_path_buf(), "WAL", allow_v6_invalidation)?;
         harden_sqlite_files(path)?;
@@ -121,7 +120,7 @@ impl Ledger {
         // accidental --db target is not modified merely by being opened.
         // migrate repeats this check under its EXCLUSIVE lock to close the
         // race between this read-only identity check and migration.
-        reject_unversioned_database_objects(&connection)?;
+        validate_database_identity(&connection)?;
         connection.pragma_update(None, "journal_mode", journal_mode)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "busy_timeout", 5_000_i64)?;
@@ -144,7 +143,7 @@ impl Ledger {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        reject_unversioned_database_objects(&transaction)?;
+        validate_database_identity(&transaction)?;
 
         transaction.execute_batch(
             r#"
@@ -294,13 +293,7 @@ impl Ledger {
         // schema inspection and is retained across every logical migration. A
         // second upgrader therefore observes the first upgrader's committed
         // version instead of replaying the same pseudonymization boundary.
-        let existing: Option<i64> = transaction
-            .query_row(
-                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let existing = read_strict_schema_version(&transaction)?;
         match existing {
             None => {
                 // A missing schema marker is only evidence of a new database
@@ -464,11 +457,8 @@ impl Ledger {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-            let version: i64 = transaction.query_row(
-                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
-                [],
-                |row| row.get(0),
-            )?;
+            let version = read_strict_schema_version(&transaction)?
+                .context("database schema version disappeared during privacy cleanup")?;
             if version != SCHEMA_VERSION {
                 anyhow::bail!(
                     "database schema changed during privacy cleanup (found {version}, expected {SCHEMA_VERSION})"
@@ -1507,40 +1497,237 @@ impl Ledger {
     }
 }
 
-/// Rejects a populated SQLite file before Token Ledger's bootstrap schema can
-/// mutate it unless a supported ledger schema version can be proven. A valid,
-/// versioned ledger may contain user-defined views; those objects are only
-/// suspicious when the database has no trustworthy generation marker.
-fn reject_unversioned_database_objects(connection: &Connection) -> Result<()> {
-    let user_objects: i64 = connection.query_row(
-        "SELECT COUNT(*)
-         FROM sqlite_schema
-         WHERE type IN ('table', 'view')
-           AND name NOT LIKE 'sqlite_%'",
+/// Proves that an existing SQLite file is a Token Ledger database before any
+/// persistent pragma, permission, or bootstrap change. A schema marker alone
+/// is not an identity token: unrelated databases can contain a `meta` table,
+/// and SQLite's numeric casts accept prefixes such as `7garbage`.
+fn validate_database_identity(connection: &Connection) -> Result<()> {
+    let object_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))?;
+    if object_count == 0 {
+        return Ok(());
+    }
+
+    let meta_is_table: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta'
+         )",
         [],
         |row| row.get(0),
     )?;
-    if user_objects == 0 {
-        return Ok(());
+    if !meta_is_table {
+        return reject_unknown_database();
     }
-
-    let version = connection
-        .query_row(
-            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional();
-    if matches!(version, Ok(Some(1..=SCHEMA_VERSION))) {
-        return Ok(());
+    require_table_shape(
+        connection,
+        "meta",
+        &[("key", "TEXT", false, 1), ("value", "TEXT", true, 0)],
+    )?;
+    let Some(version) = read_strict_schema_version(connection)? else {
+        return reject_unknown_database();
+    };
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        anyhow::bail!(
+            "database schema version {version} is unsupported by this binary (expected {SCHEMA_VERSION})"
+        );
     }
+    validate_core_ledger_schema(connection, version)
+}
 
+fn reject_unknown_database<T>() -> Result<T> {
     anyhow::bail!(
-        "database schema metadata is missing or invalid but existing user tables or views were \
-         found. Refusing to modify or mark this database privacy-safe. Restore the database \
+        "database schema metadata is missing or invalid, or the core Token Ledger schema cannot \
+         be proven. Refusing to modify or mark this database privacy-safe. Restore the database \
          (including its WAL state) from a known-good backup, or move this database aside and \
          deliberately create and rebuild a new ledger"
     )
+}
+
+fn read_strict_schema_version(connection: &Connection) -> Result<Option<i64>> {
+    let raw = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let parsed = raw
+        .parse::<i64>()
+        .ok()
+        .filter(|value| raw == value.to_string())
+        .with_context(|| format!("database schema version {raw:?} is not a canonical integer"))?;
+    Ok(Some(parsed))
+}
+
+fn validate_core_ledger_schema(connection: &Connection, version: i64) -> Result<()> {
+    let core = [
+        (
+            "source_files",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("client", "TEXT", true, 0),
+                ("path", "TEXT", true, 0),
+            ][..],
+        ),
+        (
+            "usage_observations",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("source_file_id", "INTEGER", true, 0),
+                ("event_key", "TEXT", true, 0),
+                ("session_id", "TEXT", true, 0),
+            ][..],
+        ),
+        (
+            "scan_runs",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("started_at", "TEXT", true, 0),
+                ("mode", "TEXT", true, 0),
+                ("status", "TEXT", true, 0),
+            ][..],
+        ),
+        (
+            "scan_warnings",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("scan_run_id", "INTEGER", true, 0),
+                ("code", "TEXT", true, 0),
+                ("message", "TEXT", true, 0),
+            ][..],
+        ),
+    ];
+    for (table, columns) in core {
+        require_table_shape(connection, table, columns)?;
+    }
+
+    if version >= 3 {
+        require_table_shape(
+            connection,
+            "reconciliation_imports",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("content_digest", "TEXT", true, 0),
+                ("source_kind", "TEXT", true, 0),
+            ],
+        )?;
+        require_table_shape(
+            connection,
+            "reconciliation_buckets",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("import_id", "INTEGER", true, 0),
+                ("bucket_start_utc", "TEXT", true, 0),
+                ("provider", "TEXT", true, 0),
+            ],
+        )?;
+    }
+    if version >= 6 {
+        require_table_shape(
+            connection,
+            "source_files",
+            &[
+                ("content_hash", "TEXT", true, 0),
+                ("privacy_write_generation", "INTEGER", true, 0),
+            ],
+        )?;
+        require_table_shape(
+            connection,
+            "usage_observations",
+            &[("privacy_write_generation", "INTEGER", true, 0)],
+        )?;
+        require_table_shape(
+            connection,
+            "scan_warnings",
+            &[("privacy_write_generation", "INTEGER", true, 0)],
+        )?;
+        require_table_shape(
+            connection,
+            "reconciliation_imports",
+            &[("privacy_write_generation", "INTEGER", true, 0)],
+        )?;
+        require_table_shape(
+            connection,
+            "codex_event_identity_aliases",
+            &[
+                ("source_file_id", "INTEGER", true, 1),
+                ("canonical_event_key", "TEXT", true, 2),
+                ("session_scope", "TEXT", true, 3),
+                ("source_locator", "TEXT", true, 0),
+                ("usage_event_index", "INTEGER", true, 0),
+            ],
+        )?;
+        require_table_shape(
+            connection,
+            "codex_event_identity_replays",
+            &[
+                ("source_file_id", "INTEGER", false, 1),
+                ("globally_anchored", "INTEGER", true, 0),
+            ],
+        )?;
+    }
+    if version == 7 {
+        let barrier = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                [V7_PRIVACY_BARRIER_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if !matches!(
+            barrier.as_deref(),
+            Some(V7_PRIVACY_COMPLETE | V7_PRIVACY_PENDING)
+        ) {
+            anyhow::bail!(
+                "database schema v7 is missing its canonical privacy barrier marker; refusing to modify it"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn require_table_shape(
+    connection: &Connection,
+    table: &str,
+    required: &[(&str, &str, bool, i64)],
+) -> Result<()> {
+    let object_type = connection
+        .query_row(
+            "SELECT type FROM sqlite_schema WHERE name=?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if object_type.as_deref() != Some("table") {
+        return reject_unknown_database();
+    }
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?.to_ascii_uppercase(),
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for &(name, declared_type, not_null, primary_key_position) in required {
+        if !columns.iter().any(|column| {
+            column.0 == name
+                && column.1 == declared_type
+                && column.2 == not_null
+                && column.3 == primary_key_position
+        }) {
+            anyhow::bail!(
+                "database table {table:?} does not match the required Token Ledger column shape; refusing to modify it"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Returns true when a database without `schema_version` cannot be proven
@@ -1590,8 +1777,8 @@ fn database_has_existing_state(transaction: &Transaction<'_>) -> Result<bool> {
 fn advance_schema_version(transaction: &Transaction<'_>, expected: i64, next: i64) -> Result<()> {
     let changed = transaction.execute(
         r#"UPDATE meta SET value=?1
-           WHERE key='schema_version' AND CAST(value AS INTEGER)=?2"#,
-        params![next.to_string(), expected],
+           WHERE key='schema_version' AND value=?2"#,
+        params![next.to_string(), expected.to_string()],
     )?;
     if changed != 1 {
         anyhow::bail!(
@@ -1763,56 +1950,56 @@ fn install_privacy_write_guard_triggers(transaction: &Transaction<'_>) -> Result
         r#"
         CREATE TRIGGER guard_source_files_v6_insert
         BEFORE INSERT ON source_files
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_source_files_v6_update
         BEFORE UPDATE ON source_files
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_usage_observations_v6_insert
         BEFORE INSERT ON usage_observations
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_usage_observations_v6_update
         BEFORE UPDATE ON usage_observations
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_scan_warnings_v6_insert
         BEFORE INSERT ON scan_warnings
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_scan_warnings_v6_update
         BEFORE UPDATE ON scan_warnings
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_reconciliation_imports_v6_insert
         BEFORE INSERT ON reconciliation_imports
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
         END;
         CREATE TRIGGER guard_reconciliation_imports_v6_update
         BEFORE UPDATE ON reconciliation_imports
-        WHEN CAST((SELECT value FROM meta WHERE key='schema_version') AS INTEGER)>=6
+        WHEN (SELECT value FROM meta WHERE key='schema_version') IN ('6','7')
              AND NEW.privacy_write_generation<>OLD.privacy_write_generation+1
         BEGIN
             SELECT RAISE(ABORT, 'legacy writer rejected by privacy generation guard');
@@ -1833,7 +2020,9 @@ fn install_schema_version_guard_triggers(transaction: &Transaction<'_>) -> Resul
         WHEN OLD.key='schema_version'
              AND (
                  NEW.key<>'schema_version'
-                 OR CAST(NEW.value AS INTEGER)<CAST(OLD.value AS INTEGER)
+                 OR NEW.value NOT IN ('1','2','3','4','5','6','7')
+                 OR OLD.value NOT IN ('1','2','3','4','5','6','7')
+                 OR NEW.value<OLD.value
              )
         BEGIN
             SELECT RAISE(ABORT, 'database schema downgrade rejected');
@@ -1848,8 +2037,11 @@ fn install_schema_version_guard_triggers(transaction: &Transaction<'_>) -> Resul
         BEFORE INSERT ON meta
         WHEN NEW.key='schema_version'
              AND EXISTS(SELECT 1 FROM meta WHERE key='schema_version')
-             AND CAST(NEW.value AS INTEGER)<CAST(
-                 (SELECT value FROM meta WHERE key='schema_version') AS INTEGER
+             AND (
+                 NEW.value NOT IN ('1','2','3','4','5','6','7')
+                 OR (SELECT value FROM meta WHERE key='schema_version')
+                    NOT IN ('1','2','3','4','5','6','7')
+                 OR NEW.value<(SELECT value FROM meta WHERE key='schema_version')
              )
         BEGIN
             SELECT RAISE(ABORT, 'database schema downgrade rejected');
@@ -1861,15 +2053,18 @@ fn install_schema_version_guard_triggers(transaction: &Transaction<'_>) -> Resul
 
 #[cfg(unix)]
 fn prepare_private_database_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::io::ErrorKind;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).mode(0o600);
-    let file = options
-        .open(path)
-        .with_context(|| format!("failed to create database file {}", path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to secure database file {}", path.display()))
+    options.read(true).write(true).create_new(true).mode(0o600);
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to create database file {}", path.display()))
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -3522,11 +3717,15 @@ mod tests {
         let dir = tempdir()?;
         let database = dir.path().join("v2.sqlite");
         {
+            drop(Ledger::open(&database)?);
             let connection = Connection::open(&database)?;
             connection.execute_batch(
                 r#"
-                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO meta(key, value) VALUES ('schema_version', '2');
+                DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+                DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+                DROP TRIGGER IF EXISTS guard_schema_version_no_replace;
+                UPDATE meta SET value='2' WHERE key='schema_version';
+                DROP TABLE scan_runs;
                 CREATE TABLE scan_runs (
                     id INTEGER PRIMARY KEY,
                     started_at TEXT NOT NULL,
@@ -3563,11 +3762,14 @@ mod tests {
         let dir = tempdir()?;
         let database = dir.path().join("v3.sqlite");
         {
+            drop(Ledger::open(&database)?);
             let connection = Connection::open(&database)?;
             connection.execute_batch(
                 r#"
-                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+                DROP TRIGGER IF EXISTS guard_schema_version_no_downgrade;
+                DROP TRIGGER IF EXISTS guard_schema_version_no_delete;
+                DROP TRIGGER IF EXISTS guard_schema_version_no_replace;
+                UPDATE meta SET value='3' WHERE key='schema_version';
                 "#,
             )?;
         }
@@ -4534,6 +4736,30 @@ mod tests {
         assert_eq!(
             journal_mode, original_journal_mode,
             "read-only identity refusal must not persist a new journal mode"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_database_permissions_are_not_changed() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let database = directory.path().join("unrelated-mode.sqlite");
+        {
+            let connection = Connection::open(&database)?;
+            connection.execute_batch("CREATE TABLE unrelated(secret TEXT)")?;
+        }
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o666))?;
+
+        let error = Ledger::open(&database)
+            .err()
+            .context("unrelated database must be rejected")?;
+        assert!(error.to_string().contains("schema metadata is missing"));
+        assert_eq!(
+            std::fs::metadata(&database)?.permissions().mode() & 0o777,
+            0o666
         );
         Ok(())
     }
